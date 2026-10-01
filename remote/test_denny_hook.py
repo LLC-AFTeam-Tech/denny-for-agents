@@ -52,6 +52,8 @@ class HookTests(unittest.TestCase):
         hook.CONFIG_PATH = os.path.join(hook.BASE_DIR, "remote.json")
         hook.INSTALLED_SCRIPT = os.path.join(hook.BASE_DIR, "denny-hook.py")
         hook.INBOX = os.path.join(self.home, "denny-inbox")
+        hook.STATUSLINE_PATH = os.path.join(hook.BASE_DIR, "claude-statusline.json")
+        hook.STATUSLINE_ORIGINAL = os.path.join(hook.BASE_DIR, "statusline-original.json")
         hook.CONFIG_FILES = {
             "claude": os.path.join(self.home, ".claude", "settings.json"),
             "codex": os.path.join(self.home, ".codex", "hooks.json"),
@@ -188,6 +190,30 @@ class HookTests(unittest.TestCase):
         self.assertEqual(claude["hooks"], {"PreToolUse": [user_hook]})
         self.assertEqual(json.load(open(hook.CONFIG_FILES["codex"])), {})
 
+    def test_statusline_records_limits_and_prints(self):
+        payload = json.dumps({"rate_limits": {"five_hour": {"used_percentage": 23.5, "resets_at": 1000 + 7800},
+                                              "seven_day": {"used_percentage": 41.2, "resets_at": 1000 + 3 * 86400}}}).encode()
+        line = hook.run_statusline(payload, now=1000)
+        self.assertEqual(line, "Denny · 5h 24% (2h10m) · 7d 41% (3d0h)\n")
+        live = hook.statusline_limits()
+        self.assertEqual([(w["kind"], w["percent"]) for w in live["windows"]], [("session", 23.5), ("weekly", 41.2)])
+        self.assertEqual(hook.run_statusline(b"not json", now=1000), "Denny\n")
+
+    def test_statusline_install_chains_and_restores_user_line(self):
+        path = hook.CONFIG_FILES["claude"]
+        os.makedirs(os.path.dirname(path))
+        mine = {"type": "command", "command": "echo my-line", "refreshInterval": 5}
+        with open(path, "w") as handle:
+            json.dump({"statusLine": mine}, handle)
+        hook.install(47321, "tok" * 16, ["claude"])
+        config = json.load(open(path))
+        self.assertIn("--statusline", config["statusLine"]["command"])
+        self.assertEqual(hook.run_statusline(b"{}"), "my-line\n")
+        hook.install(47321, "tok" * 16, ["claude"])
+        self.assertEqual(json.load(open(hook.STATUSLINE_ORIGINAL))["command"], "echo my-line")
+        hook.uninstall()
+        self.assertEqual(json.load(open(path))["statusLine"], mine)
+
     def test_install_refuses_unreadable_config(self):
         path = hook.CONFIG_FILES["claude"]
         os.makedirs(os.path.dirname(path))
@@ -206,7 +232,7 @@ def jsonl(path, entries):
 
 
 def claude_entry(request, output, when="2026-10-01T10:15:00.000Z", model="claude-opus-5-5"):
-    return {"type": "assistant", "timestamp": when, "requestId": request,
+    return {"type": "assistant", "timestamp": when, "requestId": request, "cwd": "/root/projects/shop",
             "message": {"model": model, "usage": {
                 "input_tokens": 2, "cache_creation_input_tokens": 100, "cache_read_input_tokens": 1000,
                 "output_tokens": output,
@@ -223,6 +249,7 @@ class UsageTests(unittest.TestCase):
         hook.CODEX_SESSIONS = os.path.join(self.home, ".codex", "sessions")
         hook.CLAUDE_JSON = os.path.join(self.home, ".claude.json")
         hook.CLAUDE_APP_HISTORY = os.path.join(self.home, "claude-app.json")
+        hook.STATUSLINE_PATH = os.path.join(hook.BASE_DIR, "claude-statusline.json")
         self.now = hook.parse_time("2026-10-01T12:00:00Z")
         # Never touch a real Codex account from tests.
         self.real_binary = hook.codex_binary
@@ -248,7 +275,9 @@ class UsageTests(unittest.TestCase):
     def test_claude_streamed_reply_counted_once_and_incremental(self):
         path = os.path.join(hook.CLAUDE_PROJECTS, "-root", "s.jsonl")
         jsonl(path, [claude_entry("r1", 10), claude_entry("r1", 50), {"type": "user", "message": {}}])
-        first = self.totals(hook.build_report(self.now), "claude")
+        report = hook.build_report(self.now)
+        self.assertEqual({item["project"] for item in report["usage"]}, {"shop"})
+        first = self.totals(report, "claude")
         self.assertEqual(first, {"input": 2, "cacheWrite5m": 0, "cacheWrite1h": 100, "cacheRead": 1000, "output": 50})
         jsonl(path, [claude_entry("r1", 70), claude_entry("r2", 5)])
         second = self.totals(hook.build_report(self.now), "claude")
@@ -276,14 +305,17 @@ class UsageTests(unittest.TestCase):
         limits = {"primary": {"used_percent": 42.0, "window_minutes": 300, "resets_at": 1790900000},
                   "secondary": {"used_percent": 96.0, "window_minutes": 10080, "resets_at": 1791000000},
                   "plan_type": "plus"}
-        jsonl(path, [{"type": "turn_context", "payload": {"model": "gpt-5.6-sol"}},
+        jsonl(path, [{"type": "turn_context", "payload": {"model": "gpt-5.6-sol", "cwd": "/Users/t/app"}},
                      count(1000, 800, 50, limits), count(1500, 1200, 80, {"primary": None})])
         report = hook.build_report(self.now)
         totals = self.totals(report, "codex")
         self.assertEqual(totals, {"input": 300, "cacheWrite5m": 0, "cacheWrite1h": 0, "cacheRead": 1200, "output": 80})
         self.assertEqual({item["model"] for item in report["usage"]}, {"gpt-5.6-sol"})
+        self.assertEqual({item["project"] for item in report["usage"]}, {"app"})
         codex = [entry for entry in report["limits"] if entry["agent"] == "codex"][0]
         self.assertEqual(codex["plan"], "Plus")
+        self.assertEqual(codex["planPrice"], 20.0)
+        self.assertNotIn("planRaw", codex)
         self.assertEqual([(w["kind"], w["percent"]) for w in codex["windows"]], [("session", 42.0), ("weekly", 96.0)])
 
     def test_claude_limits_from_claude_json_and_app(self):
@@ -295,14 +327,36 @@ class UsageTests(unittest.TestCase):
                     {"kind": "weekly_opus", "group": "weekly", "percent": 5, "resets_at": None}]}}}, handle)
         limits = hook.claude_limits()
         self.assertEqual(limits["plan"], "Max")
+        self.assertIsNone(limits["planPrice"])
         self.assertEqual([(w["kind"], w["label"], w["percent"]) for w in limits["windows"]],
                          [("session", None, 12.0), ("weekly", None, 30.0), ("weekly", "Opus", 5.0)])
         with open(hook.CLAUDE_APP_HISTORY, "w") as handle:
             json.dump({"version": 2, "samples": [{"t": 2000_000, "u": {"fh": 96, "sd": 54}}]}, handle)
         fresher = hook.claude_limits()
         self.assertEqual([(w["kind"], w["percent"]) for w in fresher["windows"]], [("session", 96.0), ("weekly", 54.0)])
+        os.makedirs(hook.BASE_DIR, exist_ok=True)
+        with open(hook.STATUSLINE_PATH, "w") as handle:
+            json.dump({"observedAt": 3000, "five_hour": {"percent": 7, "resetsAt": 5000}}, handle)
+        live = hook.claude_limits()
+        self.assertEqual([(w["kind"], w["percent"], w["resetsAt"]) for w in live["windows"]], [("session", 7.0, 5000.0)])
+        self.assertEqual((live["plan"], live["observedAt"]), ("Max", 3000.0))
         self.assertEqual(fresher["windows"][0]["resetsAt"], hook.parse_time("2026-10-01T15:00:00Z"))
         self.assertEqual(fresher["observedAt"], 2000.0)
+
+    def test_max_tier_and_price(self):
+        with open(hook.CLAUDE_JSON, "w") as handle:
+            json.dump({"oauthAccount": {"organizationType": "claude_max",
+                                        "organizationRateLimitTier": "default_claude_max_20x"}}, handle)
+        limits = hook.claude_limits()
+        self.assertEqual((limits["plan"], limits["planPrice"]), ("Max 20x", 200.0))
+
+    def test_old_bucket_keys_still_read(self):
+        os.makedirs(hook.BASE_DIR, exist_ok=True)
+        state = hook.empty_state()
+        state["buckets"]["%d|claude|claude-opus-5-5" % (self.now // 3600 * 3600)] = [1, 0, 0, 0, 2]
+        hook.save_state(state)
+        item = hook.build_report(self.now)["usage"][0]
+        self.assertEqual((item["project"], item["output"]), ("", 2))
 
     def test_old_buckets_are_pruned(self):
         path = os.path.join(hook.CLAUDE_PROJECTS, "-root", "s.jsonl")

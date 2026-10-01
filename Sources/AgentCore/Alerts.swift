@@ -35,7 +35,7 @@ public struct AlertTracker: Equatable, Sendable {
         guard let threshold = settings.limitPercent else { return [] }
         var alerts: [(agent: AgentKind, window: UsageReport.Window)] = []
         for agent in AgentKind.allCases {
-            for window in summary.limits[agent]?.windows ?? [] where window.percent >= Double(threshold) {
+            for window in summary.limits[agent]?.windows ?? [] where !window.isStale && window.percent >= Double(threshold) {
                 // A new period (new reset time) may alert again.
                 let period = window.resetsAt.map { String(Int($0 / 3600)) } ?? "?"
                 if remember("limit|\(agent.rawValue)|\(window.kind)|\(window.label ?? "")|\(threshold)|\(period)") {
@@ -56,5 +56,32 @@ public struct AlertTracker: Equatable, Sendable {
         sent.append(key)
         if sent.count > Self.maxRemembered { sent.removeFirst(sent.count - Self.maxRemembered) }
         return true
+    }
+}
+
+/// Spots a limit window that just renewed: it was high and is now far lower.
+public enum LimitRenewal {
+    public static let wasAtLeast: Double = 80
+    public static let droppedBy: Double = 50
+
+    public static func key(_ agent: AgentKind, _ window: UsageReport.Window) -> String {
+        "\(agent.rawValue)|\(window.kind)|\(window.label ?? "")"
+    }
+
+    /// Returns the renewed windows and the levels to remember for next time.
+    public static func detect(previous: [String: Double], summary: UsageSummary)
+        -> (renewed: [(agent: AgentKind, window: UsageReport.Window)], levels: [String: Double]) {
+        var levels = previous
+        var renewed: [(agent: AgentKind, window: UsageReport.Window)] = []
+        for agent in AgentKind.allCases {
+            for window in summary.limits[agent]?.windows ?? [] where !window.isStale {
+                let key = key(agent, window)
+                if let before = previous[key], before >= wasAtLeast, window.percent <= before - droppedBy {
+                    renewed.append((agent, window))
+                }
+                levels[key] = window.percent
+            }
+        }
+        return (renewed, levels)
     }
 }

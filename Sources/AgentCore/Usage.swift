@@ -7,17 +7,19 @@ public struct UsageReport: Codable, Equatable, Sendable {
         public var hour: Double
         public var agent: AgentKind
         public var model: String
+        public var project: String?
         public var input: Int
         public var cacheWrite5m: Int
         public var cacheWrite1h: Int
         public var cacheRead: Int
         public var output: Int
 
-        public init(hour: Double, agent: AgentKind, model: String, input: Int = 0, cacheWrite5m: Int = 0,
-                    cacheWrite1h: Int = 0, cacheRead: Int = 0, output: Int = 0) {
+        public init(hour: Double, agent: AgentKind, model: String, project: String? = nil, input: Int = 0,
+                    cacheWrite5m: Int = 0, cacheWrite1h: Int = 0, cacheRead: Int = 0, output: Int = 0) {
             self.hour = hour
             self.agent = agent
             self.model = model
+            self.project = project
             self.input = input
             self.cacheWrite5m = cacheWrite5m
             self.cacheWrite1h = cacheWrite1h
@@ -34,24 +36,49 @@ public struct UsageReport: Codable, Equatable, Sendable {
         public var label: String?
         public var percent: Double
         public var resetsAt: Double?
+        /// Set on the Mac: the reading is older than the window itself, so the
+        /// real level is unknown (it has certainly renewed since).
+        public var stale: Bool?
 
-        public init(kind: String, label: String? = nil, percent: Double, resetsAt: Double? = nil) {
+        public init(kind: String, label: String? = nil, percent: Double, resetsAt: Double? = nil, stale: Bool? = nil) {
             self.kind = kind
             self.label = label
             self.percent = percent
             self.resetsAt = resetsAt
+            self.stale = stale
+        }
+
+        public var isStale: Bool { stale == true }
+
+        public var length: TimeInterval { kind == "session" ? 5 * 3600 : 7 * 86400 }
+
+        /// What this reading means now: a passed reset is a renewed (0%) window;
+        /// a reading older than the window, with no reset time, is unknown.
+        public func current(observedAt: Double, now: Double) -> Window {
+            var window = self
+            if let resetsAt, resetsAt <= now {
+                window.percent = 0
+                window.resetsAt = nil
+                window.stale = nil
+            } else if resetsAt == nil, now - observedAt > length {
+                window.stale = true
+            }
+            return window
         }
     }
 
     public struct Limits: Codable, Equatable, Sendable {
         public var agent: AgentKind
         public var plan: String?
+        /// Monthly list price of the plan in USD, when known.
+        public var planPrice: Double?
         public var windows: [Window]
         public var observedAt: Double
 
-        public init(agent: AgentKind, plan: String? = nil, windows: [Window], observedAt: Double) {
+        public init(agent: AgentKind, plan: String? = nil, planPrice: Double? = nil, windows: [Window], observedAt: Double) {
             self.agent = agent
             self.plan = plan
+            self.planPrice = planPrice
             self.windows = windows
             self.observedAt = observedAt
         }
@@ -85,6 +112,25 @@ public struct UsageReport: Codable, Equatable, Sendable {
     public var limits: [Limits]
     public var activity: [Activity]
     public var resets: [Resets]?
+    public var system: System?
+
+    /// Load of a Linux server, from /proc.
+    public struct System: Codable, Equatable, Sendable {
+        public var load1: Double
+        public var load5: Double
+        public var load15: Double
+        public var cpus: Int
+        public var memTotal: Double
+        public var memAvailable: Double
+        public var swapTotal: Double
+        public var swapUsed: Double
+        public var uptime: Double
+
+        public var memoryUsedFraction: Double { memTotal > 0 ? 1 - memAvailable / memTotal : 0 }
+        public var loadFraction: Double { cpus > 0 ? load1 / Double(cpus) : 0 }
+        /// Less than a tenth of memory left: a heavy build may get killed.
+        public var memoryLow: Bool { memTotal > 0 && memAvailable / memTotal < 0.1 }
+    }
 
     public init(host: String, generatedAt: Double, usage: [Item] = [], limits: [Limits] = [], activity: [Activity] = [],
                 resets: [Resets]? = nil) {
@@ -123,11 +169,30 @@ public enum Pricing {
         ("claude-haiku-4-5", Price(input: 1, output: 5, cacheRead: 0.1))
     ].sorted { $0.prefix.count > $1.prefix.count }
 
+    /// Fresher prices downloaded by the app (prices.json); they win over the table.
+    public static var overrides: [(prefix: String, price: Price)] = []
+
     public static func price(for model: String) -> Price? {
         let normalized = model.lowercased()
             .replacingOccurrences(of: "[1m]", with: "")
             .replacingOccurrences(of: ".", with: "-")
-        return table.first { normalized.hasPrefix($0.prefix) }?.price
+        return (overrides + table).first { normalized.hasPrefix($0.prefix) }?.price
+    }
+
+    /// `{"models": {"model-prefix": {"input": 4, "output": 20, "cacheRead": 0.2}}}`
+    public static func overrides(fromJSON data: Data) -> [(prefix: String, price: Price)]? {
+        guard let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let models = root["models"] as? [String: Any] else { return nil }
+        var result: [(prefix: String, price: Price)] = []
+        for (prefix, value) in models {
+            guard let fields = value as? [String: Any],
+                  let input = (fields["input"] as? NSNumber)?.doubleValue,
+                  let output = (fields["output"] as? NSNumber)?.doubleValue else { continue }
+            let cacheRead = (fields["cacheRead"] as? NSNumber)?.doubleValue ?? input * 0.1
+            let key = prefix.lowercased().replacingOccurrences(of: ".", with: "-")
+            result.append((key, Price(input: input, output: output, cacheRead: cacheRead)))
+        }
+        return result.sorted { $0.prefix.count > $1.prefix.count }
     }
 
     public static func cost(_ item: UsageReport.Item) -> Double? {
@@ -178,6 +243,26 @@ public struct UsageSummary: Equatable, Sendable {
     public var activeDays = 0
     public var busiestDay: Day?
 
+    public struct Share: Equatable, Sendable {
+        public var name: String
+        public var tokens: Int
+        public var cost: Double
+        public var fullyPriced: Bool
+        public var agent: AgentKind
+    }
+
+    public struct Bar: Equatable, Sendable {
+        public var start: Date
+        public var cost: [AgentKind: Double]
+        public var tokens: [AgentKind: Int]
+    }
+
+    /// Biggest first; models and projects for each period.
+    public var models: [UsagePeriod: [Share]] = [:]
+    public var projects: [UsagePeriod: [Share]] = [:]
+    /// Today by hour, 7 and 30 days by day.
+    public var trend: [UsagePeriod: [Bar]] = [:]
+
     public var limits: [AgentKind: UsageReport.Limits] = [:]
     public var resets: [AgentKind: UsageReport.Resets] = [:]
     public var lastActivity: [AgentKind: Date] = [:]
@@ -185,6 +270,20 @@ public struct UsageSummary: Equatable, Sendable {
     public var agentsSeen: [AgentKind] = []
 
     public init() {}
+
+    /// Every hour of today / every day of the period, empty ones included.
+    static func filledBars(_ bars: [Date: Bar], period: UsagePeriod, starts: [UsagePeriod: Date], now: Date,
+                           calendar: Calendar) -> [Bar] {
+        guard var cursor = starts[period] else { return [] }
+        let step: Calendar.Component = period == .today ? .hour : .day
+        var result: [Bar] = []
+        while cursor <= now {
+            result.append(bars[cursor] ?? Bar(start: cursor, cost: [:], tokens: [:]))
+            guard let next = calendar.date(byAdding: step, value: 1, to: cursor) else { break }
+            cursor = next
+        }
+        return result
+    }
 
     mutating func fillActivity(_ tokensByDay: [Date: Int], from start: Date, today: Date, calendar: Calendar) {
         var day = start
@@ -218,6 +317,9 @@ public struct UsageSummary: Equatable, Sendable {
         let weekStart = calendar.dateInterval(of: .weekOfYear, for: now)?.start ?? startOfToday
         let mapStart = calendar.date(byAdding: .weekOfYear, value: -12, to: weekStart) ?? weekStart
         var tokensByDay: [Date: Int] = [:]
+        var modelShares: [UsagePeriod: [String: Share]] = [:]
+        var projectShares: [UsagePeriod: [String: Share]] = [:]
+        var bars: [UsagePeriod: [Date: Bar]] = [:]
 
         for report in reports {
             for limits in report.limits where !limits.windows.isEmpty || limits.plan != nil {
@@ -258,10 +360,42 @@ public struct UsageSummary: Equatable, Sendable {
                         spend.fullyPriced = false
                     }
                     summary.spend[period] = spend
+
+                    func add(_ name: String, to shares: inout [UsagePeriod: [String: Share]]) {
+                        var share = shares[period, default: [:]][name]
+                            ?? Share(name: name, tokens: 0, cost: 0, fullyPriced: true, agent: item.agent)
+                        share.tokens += item.totalTokens
+                        if let cost { share.cost += cost } else if item.totalTokens > 0 { share.fullyPriced = false }
+                        shares[period, default: [:]][name] = share
+                    }
+                    add(item.model, to: &modelShares)
+                    add(item.project.flatMap { $0.isEmpty ? nil : $0 } ?? item.agent.displayName, to: &projectShares)
+
+                    let bucket = period == .today
+                        ? calendar.dateInterval(of: .hour, for: hour)?.start ?? hour
+                        : calendar.startOfDay(for: hour)
+                    if bucket >= start {
+                        var bar = bars[period, default: [:]][bucket] ?? Bar(start: bucket, cost: [:], tokens: [:])
+                        bar.tokens[item.agent, default: 0] += item.totalTokens
+                        if let cost { bar.cost[item.agent, default: 0] += cost }
+                        bars[period, default: [:]][bucket] = bar
+                    }
                 }
             }
         }
         summary.agentsSeen = AgentKind.allCases.filter(seen.contains)
+        let nowSeconds = now.timeIntervalSince1970
+        for (agent, limits) in summary.limits {
+            var current = limits
+            current.windows = limits.windows.map { $0.current(observedAt: limits.observedAt, now: nowSeconds) }
+            summary.limits[agent] = current
+        }
+        for period in UsagePeriod.allCases {
+            summary.models[period] = (modelShares[period] ?? [:]).values.sorted { $0.tokens > $1.tokens }
+            summary.projects[period] = (projectShares[period] ?? [:]).values.sorted { $0.tokens > $1.tokens }
+            summary.trend[period] = Self.filledBars(bars[period] ?? [:], period: period, starts: starts, now: now,
+                                                    calendar: calendar)
+        }
         summary.fillActivity(tokensByDay, from: mapStart, today: startOfToday, calendar: calendar)
         return summary
     }

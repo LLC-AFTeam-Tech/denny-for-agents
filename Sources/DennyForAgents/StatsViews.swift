@@ -1,4 +1,5 @@
 import AgentCore
+import AppKit
 import SwiftUI
 
 extension AgentKind {
@@ -18,9 +19,21 @@ func limitTint(_ agent: AgentKind, percent: Double) -> Color {
 }
 
 /// Two cards a row: each agent's limits, then spending and "now".
+/// The two pages of the open notch.
+enum NotchPage: String {
+    case overview
+    case stats
+}
+
+/// Cards the user can show or hide from the menu bar.
+enum StatsCardKind: String, CaseIterable {
+    case limits, spending, now, value, trend, models, projects, activity
+}
+
 struct StatsGrid: View {
     let summary: UsageSummary
     @Binding var period: UsagePeriod
+    var visible: Set<StatsCardKind> = Set(StatsCardKind.allCases)
     let workingAgents: Set<AgentKind>
     let now: Date
     var canResetCodex = false
@@ -30,21 +43,26 @@ struct StatsGrid: View {
 
     var body: some View {
         VStack(spacing: 8) {
-            HStack(alignment: .top, spacing: 8) {
-                ForEach(summary.agentsSeen, id: \.self) { agent in
-                    LimitsCard(agent: agent, limits: summary.limits[agent], now: now,
-                               resets: summary.resets[agent], canReset: canResetCodex && agent == .codex,
-                               resetting: resettingCodex, onReset: onResetCodex)
+            if visible.contains(.limits) {
+                HStack(alignment: .top, spacing: 8) {
+                    ForEach(summary.agentsSeen, id: \.self) { agent in
+                        LimitsCard(agent: agent, limits: summary.limits[agent], now: now,
+                                   resets: summary.resets[agent], canReset: canResetCodex && agent == .codex,
+                                   resetting: resettingCodex, onReset: onResetCodex)
+                    }
                 }
+                .environment(\.statsRow, 0)
             }
-            .environment(\.statsRow, 0)
-            HStack(alignment: .top, spacing: 8) {
-                SpendCard(spend: summary.spend[period] ?? UsageSummary.Spend(), period: $period)
-                NowCard(summary: summary, workingAgents: workingAgents, now: now)
-            }
-            .environment(\.statsRow, 1)
-            if summary.activeDays > 0 {
-                ActivityCard(summary: summary)
+            if visible.contains(.spending) || visible.contains(.now) {
+                HStack(alignment: .top, spacing: 8) {
+                    if visible.contains(.spending) {
+                        SpendCard(spend: summary.spend[period] ?? UsageSummary.Spend(), period: $period)
+                    }
+                    if visible.contains(.now) {
+                        NowCard(summary: summary, workingAgents: workingAgents, now: now)
+                    }
+                }
+                .environment(\.statsRow, 1)
             }
         }
         .environment(\.statsRowHeights, rowHeights)
@@ -83,6 +101,49 @@ extension EnvironmentValues {
     }
 }
 
+/// The second page: value, trend, models and projects, activity.
+struct StatsPage: View {
+    let summary: UsageSummary
+    @Binding var period: UsagePeriod
+    var visible: Set<StatsCardKind> = Set(StatsCardKind.allCases)
+    @State private var rowHeights: [Int: CGFloat] = [:]
+
+    var body: some View {
+        VStack(spacing: 8) {
+            if visible.contains(.value), ValueCard.hasValue(summary) {
+                ValueCard(summary: summary)
+            }
+            if visible.contains(.trend), (summary.spend[period]?.tokens ?? 0) > 0 {
+                TrendCard(bars: summary.trend[period] ?? [], period: $period)
+            }
+            if visible.contains(.models) || visible.contains(.projects) {
+                HStack(alignment: .top, spacing: 8) {
+                    if visible.contains(.models), let models = summary.models[period], !models.isEmpty {
+                        SharesCard(title: L.models, symbol: "cpu", shares: models)
+                    }
+                    if visible.contains(.projects), let projects = summary.projects[period], !projects.isEmpty {
+                        SharesCard(title: L.projects, symbol: "folder", shares: projects)
+                    }
+                }
+                .environment(\.statsRow, 2)
+            }
+            if visible.contains(.activity), summary.activeDays > 0 {
+                ActivityCard(summary: summary)
+            }
+        }
+        .environment(\.statsRowHeights, rowHeights)
+        .onPreferenceChange(RowHeightKey.self) { rowHeights = $0 }
+    }
+
+    static func hasContent(_ summary: UsageSummary, visible: Set<StatsCardKind>) -> Bool {
+        (visible.contains(.value) && ValueCard.hasValue(summary))
+            || (visible.contains(.trend) && (summary.spend[.month]?.tokens ?? 0) > 0)
+            || (visible.contains(.models) && !(summary.models[.month] ?? []).isEmpty)
+            || (visible.contains(.projects) && !(summary.projects[.month] ?? []).isEmpty)
+            || (visible.contains(.activity) && summary.activeDays > 0)
+    }
+}
+
 struct StatsCard<Content: View>: View {
     @ViewBuilder let content: Content
     @Environment(\.statsRow) private var row
@@ -110,7 +171,7 @@ struct CardHeader<Accessory: View>: View {
     var body: some View {
         HStack(spacing: 5) {
             if let agent {
-                Circle().fill(agent.tint).frame(width: 7, height: 7)
+                AgentMark(agent: agent, size: 13)
             } else {
                 Image(systemName: symbol)
                     .font(.system(size: 9.5, weight: .semibold))
@@ -192,7 +253,8 @@ struct LimitsCard: View {
                 }
                 .opacity(stale ? 0.6 : 1)
                 if stale, let observed = limits?.observedAt {
-                    Text(L.updated(Fmt.relative(Date(timeIntervalSince1970: observed), now: now)))
+                    let unknown = limits?.windows.contains { $0.isStale } == true
+                    Text((unknown ? L.noFreshData + " · " : "") + L.updated(Fmt.relative(Date(timeIntervalSince1970: observed), now: now)))
                         .font(.system(size: 9.5))
                         .foregroundColor(.white.opacity(0.45))
                 }
@@ -252,12 +314,13 @@ struct LimitsCard: View {
                         .foregroundColor(.white.opacity(0.5))
                 }
                 Spacer(minLength: 2)
-                Text("\(Int(window.percent.rounded()))%")
+                Text(window.isStale ? "—" : "\(Int(window.percent.rounded()))%")
                     .font(.system(size: 12, weight: .semibold, design: .rounded))
-                    .foregroundColor(.white)
+                    .foregroundColor(.white.opacity(window.isStale ? 0.5 : 1))
+                    .help(window.isStale ? L.noFreshData : "")
             }
-            LimitMeter(fraction: window.percent / 100, tint: limitTint(agent, percent: window.percent),
-                       pace: pace(window))
+            LimitMeter(fraction: window.isStale ? 0 : window.percent / 100, tint: limitTint(agent, percent: window.percent),
+                       pace: window.isStale ? nil : pace(window))
         }
     }
 
@@ -277,12 +340,7 @@ struct SpendCard: View {
     var body: some View {
         StatsCard {
             CardHeader(title: L.spending, symbol: "dollarsign.circle") {
-                Button(action: cycle) {
-                    Text(L.period(period) + " ▾")
-                        .font(.system(size: 9.5, weight: .medium))
-                        .foregroundColor(.white.opacity(0.6))
-                }
-                .buttonStyle(.plain)
+                PeriodButton(period: $period)
             }
             HStack(alignment: .firstTextBaseline, spacing: 5) {
                 Text(showsTokensOnly ? Fmt.tokens(spend.tokens) : (spend.fullyPriced ? "" : "≥ ") + Fmt.cost(spend.cost))
@@ -310,9 +368,22 @@ struct SpendCard: View {
         return parts.joined(separator: " · ")
     }
 
-    private func cycle() {
-        let all = UsagePeriod.allCases
-        period = all[(all.firstIndex(of: period)! + 1) % all.count]
+}
+
+/// "Today ▾": tap to cycle today → 7 days → 30 days.
+struct PeriodButton: View {
+    @Binding var period: UsagePeriod
+
+    var body: some View {
+        Button {
+            let all = UsagePeriod.allCases
+            period = all[(all.firstIndex(of: period)! + 1) % all.count]
+        } label: {
+            Text(L.period(period) + " ▾")
+                .font(.system(size: 9.5, weight: .medium))
+                .foregroundColor(.white.opacity(0.6))
+        }
+        .buttonStyle(.plain)
     }
 }
 
@@ -326,9 +397,8 @@ struct NowCard: View {
             CardHeader(title: L.now, symbol: "waveform") { EmptyView() }
             ForEach(summary.agentsSeen, id: \.self) { agent in
                 HStack(spacing: 6) {
-                    Circle()
-                        .fill(workingAgents.contains(agent) ? agent.tint : agent.tint.opacity(0.35))
-                        .frame(width: 6, height: 6)
+                    AgentMark(agent: agent, size: 12)
+                        .opacity(workingAgents.contains(agent) ? 1 : 0.5)
                     Text(agent == .claude ? "Claude" : "Codex")
                         .font(.system(size: 11, weight: .semibold))
                         .foregroundColor(.white)
@@ -350,6 +420,151 @@ struct NowCard: View {
         if workingAgents.contains(agent) { return L.workingNow }
         guard let last = summary.lastActivity[agent] else { return "—" }
         return Fmt.relative(last, now: now)
+    }
+}
+
+/// What the last 30 days would have cost at API prices against the plan's
+/// monthly price: the "you got 62x your money" card.
+struct ValueCard: View {
+    let summary: UsageSummary
+
+    struct Row: Identifiable {
+        let agent: AgentKind
+        let plan: String
+        let price: Double
+        let value: Double
+        var id: AgentKind { agent }
+    }
+
+    static func rows(_ summary: UsageSummary) -> [Row] {
+        AgentKind.allCases.compactMap { agent in
+            guard let limits = summary.limits[agent], let price = limits.planPrice, price > 0,
+                  let value = summary.spend[.month]?.byAgent[agent], value >= 0.01 else { return nil }
+            return Row(agent: agent, plan: limits.plan ?? agent.displayName, price: price, value: value)
+        }
+    }
+
+    static func hasValue(_ summary: UsageSummary) -> Bool { !rows(summary).isEmpty }
+
+    var body: some View {
+        StatsCard {
+            CardHeader(title: L.valueTitle, symbol: "sparkles") { EmptyView() }
+            ForEach(Self.rows(summary)) { row in
+                HStack(alignment: .firstTextBaseline, spacing: 8) {
+                    AgentMark(agent: row.agent, size: 12)
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text(L.planMonthly(row.plan, Fmt.cost(row.price)))
+                            .font(.system(size: 11, weight: .semibold))
+                            .foregroundColor(.white)
+                        Text(L.valueLine(Fmt.cost(row.value)))
+                            .font(.system(size: 10))
+                            .foregroundColor(.white.opacity(0.55))
+                    }
+                    Spacer(minLength: 4)
+                    Text(multiple(row.value / row.price))
+                        .font(.system(size: 22, weight: .semibold, design: .rounded))
+                        .foregroundColor(row.agent.tint)
+                }
+            }
+        }
+    }
+
+    private func multiple(_ value: Double) -> String {
+        value >= 10 ? "×\(Int(value.rounded()))" : String(format: "×%.1f", value)
+    }
+}
+
+/// Stacked bars per hour (today) or per day (7 / 30 days), one color per agent.
+struct TrendCard: View {
+    let bars: [UsageSummary.Bar]
+    @Binding var period: UsagePeriod
+
+    private var usesCost: Bool { bars.contains { !$0.cost.isEmpty } }
+
+    private func amount(_ bar: UsageSummary.Bar, _ agent: AgentKind) -> Double {
+        usesCost ? bar.cost[agent] ?? 0 : Double(bar.tokens[agent] ?? 0)
+    }
+
+    var body: some View {
+        let peak = max(bars.map { bar in AgentKind.allCases.reduce(0) { $0 + amount(bar, $1) } }.max() ?? 0, 0.0001)
+        return StatsCard {
+            CardHeader(title: L.trend, symbol: "chart.bar") {
+                PeriodButton(period: $period)
+            }
+            HStack(alignment: .bottom, spacing: bars.count > 14 ? 2 : 4) {
+                ForEach(bars.indices, id: \.self) { index in
+                    VStack(spacing: 0) {
+                        ForEach(AgentKind.allCases.reversed(), id: \.self) { agent in
+                            Rectangle()
+                                .fill(agent.tint)
+                                .frame(height: 52 * amount(bars[index], agent) / peak)
+                        }
+                    }
+                    .frame(maxWidth: .infinity, minHeight: 52, alignment: .bottom)
+                    .background(RoundedRectangle(cornerRadius: 2).fill(Color.white.opacity(0.05)))
+                    .clipShape(RoundedRectangle(cornerRadius: 2))
+                }
+            }
+            .frame(height: 52)
+            HStack {
+                Text(bars.first.map { Fmt.barLabel($0.start, period) } ?? "")
+                Spacer()
+                Text(usesCost ? L.peak(Fmt.cost(peak)) : L.peak(Fmt.tokens(Int(peak))))
+            }
+            .font(.system(size: 9.5))
+            .foregroundColor(.white.opacity(0.45))
+        }
+    }
+}
+
+/// Top models or projects for the chosen period.
+struct SharesCard: View {
+    let title: String
+    let symbol: String
+    let shares: [UsageSummary.Share]
+
+    var body: some View {
+        let top = Array(shares.prefix(4))
+        let total = max(shares.reduce(0) { $0 + $1.tokens }, 1)
+        return StatsCard {
+            CardHeader(title: title, symbol: symbol) { EmptyView() }
+            ForEach(top.indices, id: \.self) { index in
+                let share = top[index]
+                VStack(alignment: .leading, spacing: 2) {
+                    HStack(spacing: 4) {
+                        Text(share.name)
+                            .font(.system(size: 10.5, weight: .medium))
+                            .foregroundColor(.white.opacity(0.9))
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                        Spacer(minLength: 2)
+                        Text(share.fullyPriced && share.cost >= 0.01 ? Fmt.cost(share.cost) : Fmt.tokens(share.tokens))
+                            .font(.system(size: 10.5, weight: .semibold, design: .rounded))
+                            .foregroundColor(.white)
+                    }
+                    LimitMeter(fraction: Double(share.tokens) / Double(total), tint: share.agent.tint.opacity(0.85))
+                }
+            }
+        }
+    }
+}
+
+/// The agent's own mark from its Mac app (never shipped with Denny), or a dot.
+struct AgentMark: View {
+    let agent: AgentKind
+    var size: CGFloat = 12
+
+    var body: some View {
+        if let image = AgentIcons.shared.icon(for: agent) {
+            Image(nsImage: image)
+                .resizable()
+                .interpolation(.high)
+                .frame(width: size, height: size)
+                .clipShape(RoundedRectangle(cornerRadius: size * 0.22, style: .continuous))
+        } else {
+            Circle().fill(agent.tint).frame(width: size * 0.6, height: size * 0.6)
+                .frame(width: size, height: size)
+        }
     }
 }
 
@@ -422,7 +637,52 @@ struct ActivityCard: View {
     }
 }
 
+/// Looks up the Claude and Codex app icons installed on this Mac, once.
+final class AgentIcons {
+    static let shared = AgentIcons()
+
+    private static let bundles: [AgentKind: [String]] = [
+        .claude: ["com.anthropic.claudefordesktop"],
+        .codex: ["com.openai.codex", "com.openai.chat"]
+    ]
+    private var cache: [AgentKind: NSImage?] = [:]
+
+    func icon(for agent: AgentKind) -> NSImage? {
+        if let cached = cache[agent] { return cached }
+        let image = Self.bundles[agent]?.lazy
+            .compactMap { NSWorkspace.shared.urlForApplication(withBundleIdentifier: $0) }
+            .first
+            .map { NSWorkspace.shared.icon(forFile: $0.path) }
+        cache[agent] = image
+        return image
+    }
+}
+
 enum Fmt {
+    static func bytes(_ value: Double) -> String {
+        let formatter = ByteCountFormatter()
+        formatter.countStyle = .memory
+        formatter.allowedUnits = [.useMB, .useGB]
+        return formatter.string(fromByteCount: Int64(value))
+    }
+
+    static func time(_ date: Date) -> String {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: L.language.localeIdentifier)
+        formatter.timeStyle = .short
+        return formatter.string(from: date)
+    }
+
+    static func barLabel(_ date: Date, _ period: UsagePeriod) -> String {
+        if period == .today {
+            let formatter = DateFormatter()
+            formatter.locale = Locale(identifier: L.language.localeIdentifier)
+            formatter.setLocalizedDateFormatFromTemplate("HH")
+            return formatter.string(from: date) + ":00"
+        }
+        return day(date)
+    }
+
     static func day(_ date: Date) -> String {
         let formatter = DateFormatter()
         formatter.locale = Locale(identifier: L.language.localeIdentifier)

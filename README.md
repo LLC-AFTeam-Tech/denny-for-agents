@@ -24,7 +24,8 @@ Approve permissions, watch your agents work, see your plan limits and spending �
 - 🤖 **Claude Code and Codex, live.** Every session in your notch, step by step: what it reads, edits and runs. When a long task finishes, Denny jumps for joy.
 - ✅ **Approve from the notch.** Permission requests show up with **Allow / Deny / Ask there**. If Denny isn't running, your agents ask in the terminal as usual — Denny never blocks them.
 - 🖥️ **Agents on SSH servers too.** Working in Claude Code over SSH? One forwarded port and Denny on your Mac sees the agent on the server — approvals included.
-- 📊 **Limits and spending.** Session and weekly limits for Claude and Codex with a pace marker, what your usage would cost at API prices, cache hit rate, and a 13-week activity map.
+- 📊 **Limits and spending.** Session and weekly limits for Claude and Codex with a pace marker, what your usage would cost at API prices, cache hit rate, a trend chart, top models and projects, and a 13-week activity map.
+- 💎 **Plan value.** "$1,240 at API prices on a $20 plan — ×62." The number people screenshot.
 - ⏱️ **A live number by the camera.** The current task's timer while an agent works, your tightest limit as a ring when it rests.
 - 🔄 **Codex limit resets.** See your banked resets and spend one from the notch, with a confirmation.
 - 🔔 **Quiet notifications.** Only for tasks longer than you choose, limits crossing a threshold, or a daily budget — each one once.
@@ -85,7 +86,7 @@ The forwarded port only listens on the server's `127.0.0.1`, and every request c
 
 ## Privacy
 
-Denny for Agents has no account, no analytics and no network calls of its own. Hook events travel over a local Unix socket, or through the SSH tunnel you set up. Files you drop on the notch go only to the server you're working on, with your next message.
+Denny for Agents has no account and no analytics. Its only network request is a daily download of the public price list ([`prices.json`](prices.json)) from this repository — nothing about you or your usage is sent. Hook events travel over a local Unix socket, or through the SSH tunnel you set up. Files you drop on the notch go only to the server you're working on, with your next message.
 
 ## Full Denny
 

@@ -25,10 +25,40 @@ public struct AgentSession: Equatable, Identifiable, Sendable {
     /// When the current turn began, for the timer in the closed notch.
     public var turnStartedAt: Date?
     public var stepKind: StepKind?
+    /// For the relay note: what was asked and what the agent touched.
+    public var lastPrompt: String?
+    public var touchedFiles: [String] = []
+    public var commands: [String] = []
+
+    public static let maxTouched = 20
+    public static let maxCommands = 10
 
     public var projectName: String {
         guard let cwd, !cwd.isEmpty else { return agent.displayName }
         return (cwd as NSString).lastPathComponent
+    }
+}
+
+extension AgentSession {
+    mutating func remember(toolName: String?, input: [String: JSONValue]) {
+        switch StepDescriber.kind(toolName: toolName) {
+        case .writing:
+            if let path = input["file_path"]?.stringValue ?? input["path"]?.stringValue ?? input["notebook_path"]?.stringValue
+                ?? StepDescriber.patchedPath(input) {
+                touchedFiles.removeAll { $0 == path }
+                touchedFiles.append(path)
+                if touchedFiles.count > Self.maxTouched { touchedFiles.removeFirst(touchedFiles.count - Self.maxTouched) }
+            }
+        case .running:
+            if let command = StepDescriber.command(from: input) {
+                let short = StepDescriber.shortCommand(command)
+                commands.removeAll { $0 == short }
+                commands.append(short)
+                if commands.count > Self.maxCommands { commands.removeFirst(commands.count - Self.maxCommands) }
+            }
+        default:
+            break
+        }
     }
 }
 
@@ -41,6 +71,8 @@ public struct PendingApproval: Equatable, Identifiable, Sendable {
     public let summary: String
     public let detail: String?
     public let receivedAt: Date
+    /// Denny's read of how risky this is.
+    public let risk: RiskAssessment
 }
 
 /// What Denny should do in response to a state change.
@@ -120,7 +152,8 @@ public struct AgentStore: Equatable, Sendable {
             lastMessage: nil,
             updatedAt: now,
             turnStartedAt: nil,
-            stepKind: nil
+            stepKind: nil,
+            lastPrompt: nil
         )
         if let cwd = event.cwd { session.cwd = cwd }
         if let host = event.host { session.host = host }
@@ -138,6 +171,9 @@ public struct AgentStore: Equatable, Sendable {
             session.lastMessage = nil
             session.turnStartedAt = now
             session.stepKind = nil
+            if let prompt = event.prompt, !prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                session.lastPrompt = prompt
+            }
             effects.append(.turnStarted(sessionKey: key))
         case .preToolUse:
             let step = StepDescriber.describe(toolName: event.toolName, toolInput: event.toolInput, language: language)
@@ -147,6 +183,7 @@ public struct AgentStore: Equatable, Sendable {
                 effects.append(.startedStep(sessionKey: key, kind: kind))
             }
             session.stepKind = kind
+            session.remember(toolName: event.toolName, input: event.toolInput ?? [:])
             session.status = .working
             session.currentStep = step
             session.recentSteps.append(step)
@@ -168,7 +205,8 @@ public struct AgentStore: Equatable, Sendable {
                 host: session.host,
                 summary: summary,
                 detail: Self.approvalDetail(event),
-                receivedAt: now
+                receivedAt: now,
+                risk: RiskRadar.assess(toolName: event.toolName, toolInput: event.toolInput)
             ))
             effects.append(.needsAttention(approvalId: requestId))
         case .notification:

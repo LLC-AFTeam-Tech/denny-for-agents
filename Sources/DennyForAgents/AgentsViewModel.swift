@@ -1,6 +1,39 @@
 import AgentCore
 import Foundation
 
+enum ReadoutKind: String {
+    /// The current task's timer while an agent works, the tightest limit at rest.
+    case timer
+    /// Always the tightest limit.
+    case limit
+}
+
+/// Card and readout choices from the menu bar, kept in UserDefaults.
+enum ViewSettings {
+    private static let defaults = UserDefaults.standard
+
+    static var visibleCards: Set<StatsCardKind> {
+        get { AppSettings.shared.visibleCards }
+        set { AppSettings.shared.visibleCards = newValue }
+    }
+
+    static var page: NotchPage {
+        get { defaults.string(forKey: "page").flatMap(NotchPage.init(rawValue:)) ?? .overview }
+        set { defaults.set(newValue.rawValue, forKey: "page") }
+    }
+
+    static var readout: ReadoutKind {
+        get { AppSettings.shared.readout }
+        set { AppSettings.shared.readout = newValue }
+    }
+}
+
+/// What the notch shows when it drops for a moment.
+enum PeekContent: Equatable {
+    case activity(DennyActivity)
+    case finished(title: String, detail: String)
+}
+
 struct DropMessage: Equatable {
     var title: String
     var warning: String?
@@ -25,7 +58,13 @@ final class AgentsViewModel: ObservableObject {
     @Published var summary = UsageSummary()
     @Published var period: UsagePeriod = .today
     @Published var now = Date()
-    @Published var peekActivity: DennyActivity?
+    @Published var peek: PeekContent?
+    @Published var relayOffer: RelayOffer?
+    @Published var visibleCards: Set<StatsCardKind> = ViewSettings.visibleCards
+    @Published var readout: ReadoutKind = ViewSettings.readout
+    @Published var page: NotchPage = ViewSettings.page
+    /// The open notch is capped in height; past the cap its content scrolls.
+    @Published var needsScroll = false
     @Published var dropTargeted = false
     @Published var dropMessage: DropMessage?
     /// This Mac has Codex, so a reset credit can be spent from here.
@@ -38,7 +77,7 @@ final class AgentsViewModel: ObservableObject {
     var restingLimit: (agent: AgentKind, window: UsageReport.Window)? {
         var best: (agent: AgentKind, window: UsageReport.Window)?
         for (agent, limits) in summary.limits {
-            for window in limits.windows where best.map({ window.percent > $0.window.percent }) ?? true {
+            for window in limits.windows where !window.isStale && (best.map({ window.percent > $0.window.percent }) ?? true) {
                 best = (agent, window)
             }
         }
@@ -58,7 +97,7 @@ final class AgentsViewModel: ObservableObject {
     var tightestLimit: (agent: AgentKind, window: UsageReport.Window)? {
         var best: (agent: AgentKind, window: UsageReport.Window)?
         for (agent, limits) in summary.limits {
-            for window in limits.windows where window.percent >= 90 {
+            for window in limits.windows where !window.isStale && window.percent >= 90 {
                 if best.map({ window.percent > $0.window.percent }) ?? true { best = (agent, window) }
             }
         }
@@ -89,7 +128,7 @@ final class AgentsViewModel: ObservableObject {
 
 /// UI strings, looked up in AgentCore's translation tables (Strings/*.swift).
 struct L {
-    static let language = UILanguage.current
+    static let language = AppSettings.launchLanguage
 
     private static func t(_ key: String, _ arguments: CVarArg...) -> String {
         Translations.format(key, language, arguments)
@@ -216,6 +255,111 @@ struct L {
     static var remoteUnavailable: String { t("remote.unavailable") }
     static var close: String { t("common.close") }
     static var cancel: String { t("common.cancel") }
+
+    static var noFreshData: String { t("stats.noFresh") }
+
+    static var settingsTitle: String { t("settings.title") }
+    static func riskLevel(_ level: RiskLevel) -> String {
+        switch level {
+        case .safe: return t("risk.safe")
+        case .caution: return t("risk.caution")
+        case .danger: return t("risk.danger")
+        case .critical: return t("risk.critical")
+        }
+    }
+    static func riskReason(_ reason: RiskReason) -> String {
+        t("risk.reason." + reason.key, reason.detail ?? "")
+    }
+    static var thisMac: String { t("load.thisMac") }
+    static var cpu: String { t("load.cpu") }
+    static func cpuLoad(_ cores: Int) -> String { t("load.cpuLoad", cores) }
+    static var memory: String { t("load.memory") }
+    static func pressure(_ level: Int) -> String {
+        t(level >= 4 ? "load.pressureCritical" : (level >= 2 ? "load.pressureWarning" : "load.pressureNormal"))
+    }
+    static func swap(_ value: String) -> String { t("load.swap", value) }
+    static func upFor(_ span: String) -> String { t("load.uptime", span) }
+    static var memoryLowWarning: String { t("load.memoryLow") }
+    static var noServerLoad: String { t("load.noServer") }
+    static func relayTitle(_ agent: AgentKind, until: String?) -> String {
+        until.map { t("relay.titleUntil", agent.displayName, $0) } ?? t("relay.title", agent.displayName)
+    }
+    static func relayBody(_ agent: AgentKind) -> String { t("relay.body", agent.displayName) }
+    static func relayCopy(_ agent: AgentKind) -> String { t("relay.copy", agent.displayName) }
+    static var relayLater: String { t("relay.later") }
+    static func relayCopied(_ agent: AgentKind) -> String { t("relay.copied", agent.displayName) }
+    static func relayHandoff(_ agent: AgentKind) -> String { t("relay.handoff", agent.displayName) }
+    static var quietOn: String { t("quiet.on") }
+    static func quietActive(_ time: String) -> String { t("quiet.active", time) }
+    static var refreshNow: String { t("quick.refresh") }
+    static var awakeManual: String { t("awake.manual") }
+    static var awakeDuration: String { t("awake.duration") }
+    static var awakeUntil: String { t("awake.until") }
+    static var awakeIndefinite: String { t("awake.indefinite") }
+    static var awakeStart: String { t("awake.start") }
+    static var awakeStop: String { t("awake.stop") }
+    static func awakeActiveUntil(_ time: String) -> String { t("awake.activeUntil", time) }
+    static var awakeUntilOff: String { t("awake.untilOff") }
+    static var lidClosed: String { t("awake.lid") }
+    static var lidWarning: String { t("awake.lidWarning") }
+    static var lidNeedsPower: String { t("awake.lidNeedsPower") }
+    static var menuSettings: String { t("settings.menu") }
+    static func settingsSection(_ section: SettingsSection) -> String { t("settings.section." + section.rawValue) }
+    static var connected: String { t("settings.connected") }
+    static var notConnected: String { t("settings.notConnected") }
+    static var disconnect: String { t("settings.disconnect") }
+    static var agentsFooter: String { t("settings.agentsFooter") }
+    static var keepAwake: String { t("settings.keepAwake") }
+    static var keepAwakeFooter: String { t("settings.keepAwakeFooter") }
+    static var serversConnected: String { t("settings.serversConnected") }
+    static var noServers: String { t("settings.noServers") }
+    static func lastSeen(_ when: String) -> String { t("settings.lastSeen", when) }
+    static var peeksTitle: String { t("settings.peeks") }
+    static var peekOnStart: String { t("settings.peekOnStart") }
+    static var peekOnWriting: String { t("settings.peekOnWriting") }
+    static var peekOnFinish: String { t("settings.peekOnFinish") }
+    static var displayTitle: String { t("settings.display") }
+    static var displayAuto: String { t("settings.displayAuto") }
+    static var showInFullScreen: String { t("settings.fullScreen") }
+    static var cardsFooter: String { t("settings.cardsFooter") }
+    static var languageSystem: String { t("settings.languageSystem") }
+    static var languageRestart: String { t("settings.languageRestart") }
+    static var restartNow: String { t("settings.restart") }
+    static var privacyReads: String { t("settings.privacyReads") }
+    static var privacyReadsBody: String { t("settings.privacyReadsBody") }
+    static var privacyNever: String { t("settings.privacyNever") }
+    static var privacyNeverBody: String { t("settings.privacyNeverBody") }
+    static var removeAll: String { t("settings.removeAll") }
+    static var removeAllFooter: String { t("settings.removeAllFooter") }
+    static var removeAllConfirmTitle: String { t("settings.removeAllConfirm") }
+    static func version(_ value: String) -> String { t("settings.version", value) }
+    static var aboutBody: String { t("settings.about") }
+    static var pageOverview: String { t("page.overview") }
+    static var pageStats: String { t("page.stats") }
+    static var valueTitle: String { t("value.title") }
+    static func valueLine(_ cost: String) -> String { t("value.line", cost) }
+    static func planMonthly(_ plan: String, _ price: String) -> String { t("value.planMonthly", plan, price) }
+    static var trend: String { t("stats.trend") }
+    static var models: String { t("stats.models") }
+    static var projects: String { t("stats.projects") }
+    static func peak(_ value: String) -> String { t("stats.peak", value) }
+    static func renewedTitle(_ agent: AgentKind) -> String { t("alerts.renewedTitle", agent == .claude ? "Claude" : "Codex") }
+    static var menuCards: String { t("menu.cards") }
+    static var menuReadout: String { t("menu.readout") }
+    static var readoutTimer: String { t("readout.timer") }
+    static var readoutLimit: String { t("readout.limit") }
+    static func cardName(_ card: StatsCardKind) -> String {
+        switch card {
+        case .limits: return t("card.limits")
+        case .spending: return spending
+        case .now: return now
+        case .value: return valueTitle
+        case .trend: return trend
+        case .models: return models
+        case .projects: return projects
+        case .activity: return activity
+        }
+    }
 
     static var connectTitle: String { t("connect.title") }
     static var connectBody: String { t("connect.body") }

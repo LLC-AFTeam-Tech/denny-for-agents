@@ -2,6 +2,16 @@ import AgentCore
 import SwiftUI
 import UniformTypeIdentifiers
 
+/// The round quick-action buttons at the bottom of the open notch.
+struct NotchActions {
+    var quiet: () -> Void = {}
+    var refresh: () -> Void = {}
+    var settings: () -> Void = {}
+    /// Copy a relay note for this session to the other agent.
+    var relay: (String, Bool) -> Void = { _, _ in }
+    var dismissRelay: () -> Void = {}
+}
+
 struct AgentsNotchView: View {
     @ObservedObject var model: AgentsViewModel
     let face: DennyFaceViewModel
@@ -10,6 +20,7 @@ struct AgentsNotchView: View {
     var onOpenFullDenny: () -> Void
     var onDropFiles: ([URL]) -> Void = { _ in }
     var onResetCodex: () -> Void = {}
+    var actions = NotchActions()
 
     var body: some View {
         ZStack(alignment: .top) {
@@ -23,9 +34,26 @@ struct AgentsNotchView: View {
             case .peek:
                 VStack(spacing: 0) {
                     Color.clear.frame(height: model.notchHeight)
-                    if let activity = model.peekActivity {
+                    switch model.peek {
+                    case .activity(let activity)?:
                         DennyActivityView(activity: activity, reduceMotion: false)
                             .frame(width: 168, height: 112)
+                    case .finished(let title, let detail)?:
+                        VStack(spacing: 2) {
+                            DennyRobotFaceView(model: face)
+                                .frame(width: 104, height: 72)
+                            Text(title)
+                                .font(.system(size: 12, weight: .semibold))
+                                .foregroundColor(.white)
+                                .lineLimit(1)
+                            Text(detail)
+                                .font(.system(size: 10))
+                                .foregroundColor(.white.opacity(0.6))
+                                .lineLimit(1)
+                        }
+                        .padding(.horizontal, 12)
+                    case nil:
+                        EmptyView()
                     }
                 }
             case .expanded:
@@ -51,9 +79,14 @@ struct AgentsNotchView: View {
         .frame(height: model.notchHeight)
     }
 
-    private var expanded: some View {
-        ExpandedContent(model: model, face: face, onAnswer: onAnswer, onOpenFullDenny: onOpenFullDenny,
-                        onResetCodex: onResetCodex)
+    @ViewBuilder private var expanded: some View {
+        let content = ExpandedContent(model: model, face: face, onAnswer: onAnswer, onOpenFullDenny: onOpenFullDenny,
+                                      onResetCodex: onResetCodex, actions: actions)
+        if model.needsScroll {
+            ScrollView(.vertical, showsIndicators: true) { content }
+        } else {
+            content
+        }
     }
 
     private func loadURLs(_ providers: [NSItemProvider]) {
@@ -84,21 +117,28 @@ struct ExpandedContent: View {
     var onAnswer: (String, ApprovalDecision) -> Void
     var onOpenFullDenny: () -> Void
     var onResetCodex: () -> Void = {}
+    var actions = NotchActions()
+    @ObservedObject var settings = AppSettings.shared
     /// Height measurement only: skip the web view behind the activity scene.
     var measuring = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
-            Color.clear.frame(height: max(model.notchHeight - 8, 0))
+            // The row beside the camera: Denny on the left wing, page tabs on the right.
+            HStack {
+                DennyRobotFaceView(model: face)
+                    .frame(width: 42, height: max(model.notchHeight - 4, 20))
+                Spacer()
+                CompactReadout(model: model)
+            }
+            .frame(height: model.notchHeight)
+            .padding(.horizontal, -6)
             HStack(spacing: 10) {
                 if let activity = model.headerActivity {
                     Group {
                         if measuring { Color.clear } else { DennyActivityView(activity: activity, reduceMotion: false) }
                     }
-                    .frame(width: 84, height: 56)
-                } else {
-                    DennyRobotFaceView(model: face)
-                        .frame(width: 66, height: 50)
+                    .frame(width: 60, height: 40)
                 }
                 VStack(alignment: .leading, spacing: 2) {
                     Text(title)
@@ -118,19 +158,28 @@ struct ExpandedContent: View {
             if let approval = model.approvals.first {
                 ApprovalCard(approval: approval, waitingCount: model.approvals.count - 1, onAnswer: onAnswer)
             }
-            if !model.summary.agentsSeen.isEmpty {
-                StatsGrid(summary: model.summary, period: $model.period,
+            if let offer = model.relayOffer {
+                RelayCard(offer: offer, now: model.now,
+                          onCopy: { actions.relay(offer.sessionKey, true) }, onLater: actions.dismissRelay)
+            }
+            if model.page == .stats, StatsPage.hasContent(model.summary, visible: model.visibleCards) {
+                StatsPage(summary: model.summary, period: $model.period, visible: model.visibleCards)
+            } else if !model.summary.agentsSeen.isEmpty {
+                StatsGrid(summary: model.summary, period: $model.period, visible: model.visibleCards,
                           workingAgents: model.workingAgents, now: model.now,
                           canResetCodex: model.canResetCodex, resettingCodex: model.resettingCodex,
                           onResetCodex: onResetCodex)
             }
-            ForEach(model.sessions.prefix(3)) { session in
-                SessionRow(session: session)
+            if model.page == .overview || !StatsPage.hasContent(model.summary, visible: model.visibleCards) {
+                ForEach(model.sessions.prefix(3)) { session in
+                    SessionRow(session: session, onRelay: session.lastPrompt == nil ? nil : { actions.relay(session.id, false) })
+                }
             }
             Button(action: onOpenFullDenny) {
                 Text(L.fullDenny)
-                    .font(.system(size: 11))
-                    .foregroundColor(.white.opacity(0.45))
+                    .font(.system(size: 10.5))
+                    .foregroundColor(.white.opacity(0.4))
+                    .lineLimit(1)
             }
             .buttonStyle(.plain)
         }
@@ -159,6 +208,86 @@ struct ExpandedContent: View {
         }
         if model.sessions.isEmpty { return L.noSessions }
         return model.sessions.first?.currentStep ?? ""
+    }
+}
+
+/// A round button like the ones around Vorssaint's island; the title is a tooltip.
+struct RoundButton: View {
+    let symbol: String
+    let title: String
+    let selected: Bool
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            Image(systemName: symbol)
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundColor(selected ? .black : .white.opacity(0.8))
+                .frame(width: 28, height: 28)
+                .background(Circle().fill(selected ? Color.white.opacity(0.9) : Color.white.opacity(0.1)))
+        }
+        .buttonStyle(.plain)
+        .help(title)
+        .accessibilityLabel(title)
+    }
+}
+
+struct PageTabs: View {
+    @Binding var page: NotchPage
+
+    var body: some View {
+        HStack(spacing: 2) {
+            tab(.overview, symbol: "square.grid.2x2", title: L.pageOverview)
+            tab(.stats, symbol: "chart.bar.xaxis", title: L.pageStats)
+        }
+        .padding(2)
+        .background(Capsule().fill(Color.white.opacity(0.08)))
+    }
+
+    private func tab(_ target: NotchPage, symbol: String, title: String) -> some View {
+        Button {
+            page = target
+            ViewSettings.page = target
+        } label: {
+            Image(systemName: symbol)
+                .font(.system(size: 10, weight: .semibold))
+                .foregroundColor(page == target ? .white : .white.opacity(0.45))
+                .frame(width: 26, height: 18)
+                .background(Capsule().fill(page == target ? Color.white.opacity(0.16) : .clear))
+        }
+        .buttonStyle(.plain)
+        .help(title)
+        .accessibilityLabel(title)
+    }
+}
+
+/// "Claude hit its limit until 18:40 — hand the task to Codex?"
+struct RelayCard: View {
+    let offer: RelayOffer
+    let now: Date
+    let onCopy: () -> Void
+    let onLater: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 8) {
+                AgentMark(agent: offer.from, size: 16)
+                Image(systemName: "arrow.right").font(.system(size: 10, weight: .bold)).foregroundColor(.white.opacity(0.5))
+                AgentMark(agent: offer.to, size: 16)
+                Text(L.relayTitle(offer.from, until: offer.resetsAt.flatMap { $0 > now.timeIntervalSince1970 ? Fmt.time(Date(timeIntervalSince1970: $0)) : nil }))
+                    .font(.system(size: 12, weight: .semibold))
+                    .lineLimit(1)
+            }
+            Text(L.relayBody(offer.to))
+                .font(.system(size: 11))
+                .foregroundColor(.white.opacity(0.7))
+            HStack(spacing: 8) {
+                NotchButton(title: L.relayCopy(offer.to), color: offer.to.tint, prominent: true, action: onCopy)
+                NotchButton(title: L.relayLater, color: .gray, action: onLater)
+            }
+        }
+        .padding(12)
+        .background(RoundedRectangle(cornerRadius: 14).stroke(offer.to.tint.opacity(0.7), lineWidth: 1))
     }
 }
 
@@ -238,7 +367,7 @@ struct CompactReadout: View {
     var body: some View {
         if model.mood == .needsYou {
             StatusBadge(mood: .needsYou, count: model.approvals.count)
-        } else if model.mood == .working, let turn = model.currentTurn {
+        } else if model.mood == .working, model.readout == .timer, let turn = model.currentTurn {
             HStack(spacing: 5) {
                 Circle().fill(turn.agent.tint).frame(width: 6, height: 6)
                 TimelineView(.periodic(from: turn.start, by: 1)) { context in
@@ -248,7 +377,7 @@ struct CompactReadout: View {
                         .fixedSize()
                 }
             }
-        } else if model.mood == .working {
+        } else if model.mood == .working, model.readout == .timer || model.restingLimit == nil {
             StatusBadge(mood: .working, count: 0)
         } else if let limit = model.restingLimit {
             HStack(spacing: 5) {
@@ -307,10 +436,54 @@ struct StatusBadge: View {
     }
 }
 
+extension RiskLevel {
+    var color: Color {
+        switch self {
+        case .safe: return .green
+        case .caution: return .yellow
+        case .danger: return .orange
+        case .critical: return .red
+        }
+    }
+
+    var symbol: String {
+        switch self {
+        case .safe: return "checkmark.shield.fill"
+        case .caution: return "exclamationmark.shield.fill"
+        case .danger: return "exclamationmark.triangle.fill"
+        case .critical: return "xmark.octagon.fill"
+        }
+    }
+}
+
+/// Denny's verdict on the request: a colored badge and plain-word reasons.
+struct RiskBanner: View {
+    let risk: RiskAssessment
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 3) {
+            Label(L.riskLevel(risk.level), systemImage: risk.level.symbol)
+                .font(.system(size: 11, weight: .bold))
+                .foregroundColor(risk.level.color)
+            ForEach(Array(risk.reasons.prefix(2).enumerated()), id: \.offset) { _, reason in
+                Text(L.riskReason(reason))
+                    .font(.system(size: 11))
+                    .foregroundColor(.white.opacity(0.85))
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(8)
+        .background(RoundedRectangle(cornerRadius: 8).fill(risk.level.color.opacity(0.14)))
+    }
+}
+
 struct ApprovalCard: View {
     let approval: PendingApproval
     let waitingCount: Int
     var onAnswer: (String, ApprovalDecision) -> Void
+
+    private var risky: Bool { approval.risk.level >= .danger }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -329,9 +502,18 @@ struct ApprovalCard: View {
                     .padding(8)
                     .background(RoundedRectangle(cornerRadius: 8).fill(Color.white.opacity(0.08)))
             }
+            if approval.risk.level > .safe || !approval.risk.reasons.isEmpty {
+                RiskBanner(risk: approval.risk)
+            }
             HStack(spacing: 8) {
-                NotchButton(title: L.allow, color: .green) { onAnswer(approval.id, .allow) }
-                NotchButton(title: L.deny, color: .red) { onAnswer(approval.id, .deny) }
+                // When it looks dangerous, Deny comes first and Allow steps back.
+                if risky {
+                    NotchButton(title: L.deny, color: .red, prominent: true) { onAnswer(approval.id, .deny) }
+                    NotchButton(title: L.allow, color: .gray) { onAnswer(approval.id, .allow) }
+                } else {
+                    NotchButton(title: L.allow, color: .green, prominent: true) { onAnswer(approval.id, .allow) }
+                    NotchButton(title: L.deny, color: .red) { onAnswer(approval.id, .deny) }
+                }
                 NotchButton(title: L.askThere, color: .gray) { onAnswer(approval.id, .ask) }
             }
             if waitingCount > 0 {
@@ -341,13 +523,15 @@ struct ApprovalCard: View {
             }
         }
         .padding(12)
-        .background(RoundedRectangle(cornerRadius: 14).stroke(Color.orange.opacity(0.6), lineWidth: 1))
+        .background(RoundedRectangle(cornerRadius: 14).stroke((risky ? approval.risk.level.color : Color.orange).opacity(0.7),
+                                                             lineWidth: risky ? 1.5 : 1))
     }
 }
 
 struct NotchButton: View {
     let title: String
     let color: Color
+    var prominent = false
     let action: () -> Void
 
     var body: some View {
@@ -357,7 +541,7 @@ struct NotchButton: View {
                 .foregroundColor(.white)
                 .padding(.vertical, 6)
                 .frame(maxWidth: .infinity)
-                .background(RoundedRectangle(cornerRadius: 8).fill(color.opacity(0.35)))
+                .background(RoundedRectangle(cornerRadius: 8).fill(color.opacity(prominent ? 0.6 : 0.25)))
         }
         .buttonStyle(.plain)
     }
@@ -365,6 +549,7 @@ struct NotchButton: View {
 
 struct SessionRow: View {
     let session: AgentSession
+    var onRelay: (() -> Void)?
 
     var body: some View {
         HStack(spacing: 8) {
@@ -381,6 +566,18 @@ struct SessionRow: View {
                     .lineLimit(1)
             }
             Spacer()
+            if let onRelay {
+                Button(action: onRelay) {
+                    Label(Relay.other(session.agent).displayName, systemImage: "arrow.left.arrow.right")
+                        .font(.system(size: 10, weight: .medium))
+                        .foregroundColor(.white.opacity(0.7))
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 4)
+                        .background(Capsule().fill(Color.white.opacity(0.08)))
+                }
+                .buttonStyle(.plain)
+                .help(L.relayHandoff(Relay.other(session.agent)))
+            }
         }
     }
 

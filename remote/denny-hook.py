@@ -11,6 +11,7 @@ hook exits 0 with no output and the agent carries on as if it weren't there.
   python3 denny-hook.py --uninstall
   python3 denny-hook.py --report        # usage + plan limits as JSON (used by the Mac app)
   python3 denny-hook.py --codex-reset   # spend one Codex rate-limit reset credit
+  python3 denny-hook.py --statusline    # Claude Code status line: records live plan limits
   python3 denny-hook.py claude|codex    # called by the agent itself
 """
 
@@ -52,6 +53,8 @@ EVENTS = {
               "PermissionRequest", "Stop"],
 }
 STATE_PATH = os.path.join(BASE_DIR, "usage-state.json")
+STATUSLINE_PATH = os.path.join(BASE_DIR, "claude-statusline.json")
+STATUSLINE_ORIGINAL = os.path.join(BASE_DIR, "statusline-original.json")
 LOCK_PATH = os.path.join(BASE_DIR, "usage-state.lock")
 REPORT_STAMP = os.path.join(BASE_DIR, "report-sent")
 REPORT_INTERVAL_SECONDS = 60
@@ -62,6 +65,9 @@ CLAUDE_JSON = os.path.join(HOME, ".claude.json")
 CLAUDE_APP_HISTORY = os.path.join(HOME, "Library", "Application Support", "Claude", "plan-usage-history.json")
 CODEX_SESSIONS = os.path.join(HOME, ".codex", "sessions")
 # OpenAI's internal names: "prolite" is the $100 Pro launched in April 2026.
+# Monthly list prices (USD) for "value of your plan"; unknown plans stay unpriced.
+CODEX_PLAN_PRICES = {"plus": 20.0, "prolite": 100.0, "pro_lite": 100.0, "pro": 200.0}
+CLAUDE_PLAN_PRICES = {"Pro": 20.0, "Max 5x": 100.0, "Max 20x": 200.0}
 CODEX_PLANS = {"plus": "Plus", "pro": "Pro $200", "prolite": "Pro $100", "pro_lite": "Pro $100",
                "promax": "Pro Max", "pro_max": "Pro Max", "team": "Team",
                "business": "Business", "enterprise": "Enterprise", "edu": "Edu", "free": "Free"}
@@ -328,11 +334,15 @@ def save_state(state):
     os.replace(temporary, STATE_PATH)
 
 
-def add_tokens(state, agent, model, when, tokens):
+def project_name(cwd):
+    return os.path.basename(cwd.rstrip("/")) if isinstance(cwd, str) and cwd.strip("/") else ""
+
+
+def add_tokens(state, agent, model, when, tokens, project=""):
     if not any(tokens):
         return
     hour = int(when // 3600 * 3600)
-    key = "%d|%s|%s" % (hour, agent, model)
+    key = "%d|%s|%s|%s" % (hour, agent, project.replace("|", "/"), model)
     bucket = state["buckets"].setdefault(key, [0, 0, 0, 0, 0])
     for index, value in enumerate(tokens):
         bucket[index] += value
@@ -368,9 +378,10 @@ def claude_line(state, line):
         write_5m = write_total - write_1h
     reading = [as_int(usage.get("input_tokens")), write_5m, write_1h,
                as_int(usage.get("cache_read_input_tokens")), as_int(usage.get("output_tokens"))]
+    project = project_name(entry.get("cwd"))
     key = entry.get("requestId") or message.get("id")
     if not isinstance(key, str) or not key:
-        add_tokens(state, "claude", model, when, reading)
+        add_tokens(state, "claude", model, when, reading, project)
         return
     seen = state["recent"].get(key)
     if seen is None:
@@ -380,11 +391,11 @@ def claude_line(state, line):
             for old in state["recentOrder"][:-RECENT_KEYS]:
                 state["recent"].pop(old, None)
             state["recentOrder"] = state["recentOrder"][-RECENT_KEYS:]
-        add_tokens(state, "claude", model, when, reading)
+        add_tokens(state, "claude", model, when, reading, project)
         return
     delta = [max(0, new - old) for new, old in zip(reading, seen)]
     state["recent"][key] = [max(new, old) for new, old in zip(reading, seen)]
-    add_tokens(state, "claude", model, when, delta)
+    add_tokens(state, "claude", model, when, delta, project)
 
 
 def codex_window(limit, observed):
@@ -422,6 +433,8 @@ def codex_line(state, file_state, line):
     if entry.get("type") == "turn_context":
         if isinstance(payload.get("model"), str):
             file_state["model"] = payload["model"]
+        if isinstance(payload.get("cwd"), str):
+            file_state["project"] = project_name(payload["cwd"])
         return
     if entry.get("type") != "event_msg" or payload.get("type") != "token_count":
         return
@@ -441,7 +454,7 @@ def codex_line(state, file_state, line):
         cached = min(delta[1], delta[0])
         # OpenAI counts cached tokens inside input_tokens.
         add_tokens(state, "codex", file_state.get("model") or "codex", when,
-                   [delta[0] - cached, delta[3], 0, cached, delta[2]])
+                   [delta[0] - cached, delta[3], 0, cached, delta[2]], file_state.get("project", ""))
     limits = payload.get("rate_limits")
     if isinstance(limits, dict):
         known = state.get("codexLimits") or {}
@@ -452,7 +465,7 @@ def codex_line(state, file_state, line):
                 return
             plan = limits.get("plan_type")
             state["codexLimits"] = {"agent": "codex", "observedAt": float(when), "windows": windows,
-                                    "plan": codex_plan_name(plan)}
+                                    "plan": codex_plan_name(plan), "planRaw": plan}
 
 
 def scan_file(state, path, agent, now):
@@ -502,6 +515,9 @@ def claude_limits():
         data = {}
     account = data.get("oauthAccount") if isinstance(data.get("oauthAccount"), dict) else {}
     plan = PLAN_NAMES.get(account.get("organizationType"))
+    tier = str(account.get("organizationRateLimitTier") or "")
+    if plan == "Max":
+        plan = "Max 20x" if "20x" in tier else ("Max 5x" if "5x" in tier else plan)
     cached = data.get("cachedUsageUtilization") if isinstance(data.get("cachedUsageUtilization"), dict) else {}
     utilization = cached.get("utilization") if isinstance(cached.get("utilization"), dict) else {}
     windows = []
@@ -526,7 +542,13 @@ def claude_limits():
     if windows or plan:
         result = {"agent": "claude", "plan": plan, "windows": windows,
                   "observedAt": fetched / 1000.0 if isinstance(fetched, (int, float)) else 0.0}
-    return merge_claude_app(result, plan)
+    result = merge_claude_app(result, plan)
+    live = statusline_limits()
+    if live and (not result or live["observedAt"] >= result["observedAt"]):
+        result = {"agent": "claude", "plan": plan, "windows": live["windows"], "observedAt": live["observedAt"]}
+    if result:
+        result["planPrice"] = CLAUDE_PLAN_PRICES.get(result.get("plan"))
+    return result
 
 
 def merge_claude_app(result, plan):
@@ -557,6 +579,29 @@ def merge_claude_app(result, plan):
     return {"agent": "claude", "plan": plan, "windows": windows, "observedAt": observed}
 
 
+def system_load():
+    """Load, memory and swap of this server (Linux /proc); None elsewhere."""
+    try:
+        with open("/proc/loadavg") as handle:
+            load = [float(x) for x in handle.read().split()[:3]]
+        meminfo = {}
+        with open("/proc/meminfo") as handle:
+            for line in handle:
+                key, _, rest = line.partition(":")
+                parts = rest.split()
+                if parts:
+                    meminfo[key] = int(parts[0]) * 1024
+        with open("/proc/uptime") as handle:
+            uptime = float(handle.read().split()[0])
+    except (OSError, ValueError, IndexError):
+        return None
+    return {"load1": load[0], "load5": load[1], "load15": load[2], "cpus": os.cpu_count() or 1,
+            "memTotal": meminfo.get("MemTotal", 0), "memAvailable": meminfo.get("MemAvailable", 0),
+            "swapTotal": meminfo.get("SwapTotal", 0),
+            "swapUsed": max(0, meminfo.get("SwapTotal", 0) - meminfo.get("SwapFree", 0)),
+            "uptime": uptime}
+
+
 def build_report(now=None, wait=True):
     """None when another scan holds the lock and wait is False."""
     now = now or time.time()
@@ -576,11 +621,20 @@ def build_report(now=None, wait=True):
         save_state(state)
     usage = []
     for key, tokens in state["buckets"].items():
-        hour, agent, model = key.split("|", 2)
-        item = {"hour": float(hour), "agent": agent, "model": model}
+        parts = key.split("|", 3)
+        if len(parts) == 3:  # saved before projects were tracked
+            hour, agent, model = parts
+            project = ""
+        else:
+            hour, agent, project, model = parts
+        item = {"hour": float(hour), "agent": agent, "model": model, "project": project}
         item.update(dict(zip(FIELDS, tokens)))
         usage.append(item)
     codex = state.get("codexLimits")
+    if codex:
+        raw = codex.get("planRaw") or (codex.get("plan") or "").replace(" ", "").lower()
+        codex = dict(codex, planPrice=CODEX_PLAN_PRICES.get({"pro$100": "prolite", "pro$200": "pro"}.get(raw, raw)))
+        codex.pop("planRaw", None)
     if codex and codex.get("plan"):
         # Saved by an older version as a raw name like "Prolite".
         raw = codex["plan"].replace(" ", "").lower()
@@ -588,9 +642,13 @@ def build_report(now=None, wait=True):
                                                   "pro$200": "pro", "promax": "promax"}.get(raw, raw)))
     limits = [entry for entry in (claude_limits(), codex) if entry]
     resets = [state["codexResets"]] if state.get("codexResets") else []
-    return {"host": socket.gethostname(), "generatedAt": now, "usage": usage, "limits": limits,
-            "activity": [{"agent": agent, "at": float(at)} for agent, at in state["activity"].items()],
-            "resets": resets}
+    report = {"host": socket.gethostname(), "generatedAt": now, "usage": usage, "limits": limits,
+              "activity": [{"agent": agent, "at": float(at)} for agent, at in state["activity"].items()],
+              "resets": resets}
+    system = system_load()
+    if system:
+        report["system"] = system
+    return report
 
 
 def send_report_in_background(port, token):
@@ -716,7 +774,7 @@ def refresh_codex_account(state, now, binary=None):
                            codex_account_window(snapshot.get("secondary"), "weekly")) if w]
     if windows:
         state["codexLimits"] = {"agent": "codex", "observedAt": float(now), "windows": windows,
-                                "plan": codex_plan_name(snapshot.get("planType"))}
+                                "plan": codex_plan_name(snapshot.get("planType")), "planRaw": snapshot.get("planType")}
     credits = result.get("rateLimitResetCredits")
     if isinstance(credits, dict):
         expiring = [c.get("expiresAt") for c in credits.get("credits") or []
@@ -740,6 +798,83 @@ def codex_reset():
         except OSError:
             pass
     return {"outcome": outcome or "failed"}
+
+
+# ---------------------------------------------------------------- status line
+#
+# Claude Code hands its status line command fresh plan limits after every
+# response (rate_limits.five_hour / seven_day, Pro and Max plans). Denny keeps
+# them and still runs the user's own status line, if there was one.
+
+def short_span(seconds):
+    minutes = max(0, int(seconds // 60))
+    if minutes >= 1440:
+        return "%dd%dh" % (minutes // 1440, minutes % 1440 // 60)
+    if minutes >= 60:
+        return "%dh%02dm" % (minutes // 60, minutes % 60)
+    return "%dm" % minutes
+
+
+def run_statusline(raw, now=None):
+    now = now or time.time()
+    try:
+        data = json.loads(raw or b"{}")
+    except ValueError:
+        data = {}
+    limits = data.get("rate_limits") if isinstance(data, dict) else None
+    if isinstance(limits, dict):
+        record = {"observedAt": now}
+        for key in ("five_hour", "seven_day"):
+            window = limits.get(key)
+            if isinstance(window, dict) and isinstance(window.get("used_percentage"), (int, float)):
+                record[key] = {"percent": float(window["used_percentage"]),
+                               "resetsAt": window.get("resets_at") if isinstance(window.get("resets_at"), (int, float)) else None}
+        try:
+            os.makedirs(BASE_DIR, mode=0o700, exist_ok=True)
+            temporary = STATUSLINE_PATH + ".tmp"
+            with open(temporary, "w") as handle:
+                json.dump(record, handle)
+            os.replace(temporary, STATUSLINE_PATH)
+        except OSError:
+            pass
+    try:
+        with open(STATUSLINE_ORIGINAL) as handle:
+            original = json.load(handle).get("command")
+    except (OSError, ValueError, AttributeError):
+        original = None
+    if original:
+        try:
+            result = subprocess.run(original, shell=True, input=raw, capture_output=True, timeout=5)
+            return result.stdout.decode("utf-8", "replace")
+        except (OSError, subprocess.TimeoutExpired):
+            return ""
+    parts = ["Denny"]
+    for key, label in (("five_hour", "5h"), ("seven_day", "7d")):
+        window = (limits or {}).get(key) if isinstance(limits, dict) else None
+        if isinstance(window, dict) and isinstance(window.get("used_percentage"), (int, float)):
+            text = "%s %d%%" % (label, round(window["used_percentage"]))
+            if isinstance(window.get("resets_at"), (int, float)):
+                text += " (%s)" % short_span(window["resets_at"] - now)
+            parts.append(text)
+    return " · ".join(parts) + "\n"
+
+
+def statusline_limits():
+    try:
+        with open(STATUSLINE_PATH) as handle:
+            record = json.load(handle)
+    except (OSError, ValueError):
+        return None
+    windows = []
+    for key, kind in (("five_hour", "session"), ("seven_day", "weekly")):
+        window = record.get(key)
+        if isinstance(window, dict) and isinstance(window.get("percent"), (int, float)):
+            resets = window.get("resetsAt")
+            windows.append({"kind": kind, "label": None, "percent": float(window["percent"]),
+                            "resetsAt": float(resets) if isinstance(resets, (int, float)) else None})
+    if not windows:
+        return None
+    return {"observedAt": float(record.get("observedAt") or 0), "windows": windows}
 
 
 # ---------------------------------------------------------------- install
@@ -783,6 +918,34 @@ def without_ours(table):
         if kept:
             cleaned[event] = kept
     return cleaned
+
+
+def statusline_command():
+    return "python3 '%s' --statusline" % INSTALLED_SCRIPT.replace("'", "'\\''")
+
+
+def with_statusline(config):
+    """Claude only: our status line in front, the user's kept and chained."""
+    config = dict(config)
+    current = config.get("statusLine")
+    if isinstance(current, dict) and MARKER not in str(current.get("command", "")) and current.get("command"):
+        os.makedirs(BASE_DIR, mode=0o700, exist_ok=True)
+        with open(STATUSLINE_ORIGINAL, "w") as handle:
+            json.dump({"command": current["command"], "settings": current}, handle)
+    config["statusLine"] = {"type": "command", "command": statusline_command()}
+    return config
+
+
+def without_statusline(config):
+    config = dict(config)
+    current = config.get("statusLine")
+    if isinstance(current, dict) and MARKER in str(current.get("command", "")):
+        try:
+            with open(STATUSLINE_ORIGINAL) as handle:
+                config["statusLine"] = json.load(handle)["settings"]
+        except (OSError, ValueError, KeyError):
+            config.pop("statusLine", None)
+    return config
 
 
 def merged(config, agent):
@@ -843,7 +1006,10 @@ def install(port, token, agents):
         json.dump({"port": port, "token": token}, handle)
     for agent in agents:
         path = CONFIG_FILES[agent]
-        write_json(path, merged(read_json(path), agent))
+        config = merged(read_json(path), agent)
+        if agent == "claude":
+            config = with_statusline(config)
+        write_json(path, config)
         print("Connected %s (%s)" % (agent, path))
 
 
@@ -851,8 +1017,13 @@ def uninstall():
     for agent, path in CONFIG_FILES.items():
         config = read_json(path)
         table = hooks_table(config, agent)
-        if any(isinstance(e, list) and any(is_ours(x) for x in e) for e in table.values()):
-            write_json(path, removed(config, agent))
+        status = config.get("statusLine") if isinstance(config.get("statusLine"), dict) else {}
+        ours_status = agent == "claude" and MARKER in str(status.get("command", ""))
+        if ours_status or any(isinstance(e, list) and any(is_ours(x) for x in e) for e in table.values()):
+            cleaned = removed(config, agent)
+            if agent == "claude":
+                cleaned = without_statusline(cleaned)
+            write_json(path, cleaned)
             print("Disconnected %s (%s)" % (agent, path))
 
 
@@ -895,6 +1066,13 @@ def main(argv):
         return 0
     if "--ping" in argv:
         return ping()
+    if "--statusline" in argv:
+        try:
+            raw = sys.stdin.buffer.read()
+            sys.stdout.write(run_statusline(raw))
+        except Exception:
+            pass
+        return 0
     if "--codex-reset" in argv:
         sys.stdout.write(json.dumps(codex_reset()) + "\n")
         return 0

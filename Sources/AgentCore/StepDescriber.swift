@@ -100,6 +100,19 @@ public enum StepDescriber {
         return nil
     }
 
+    /// The full path an apply_patch touches.
+    static func patchedPath(_ input: [String: JSONValue]) -> String? {
+        let patch = input["input"]?.stringValue ?? input["patch"]?.stringValue ?? input["command"]?.stringValue
+        guard let patch else { return nil }
+        for marker in ["*** Update File: ", "*** Add File: ", "*** Delete File: "] {
+            if let range = patch.range(of: marker) {
+                let path = patch[range.upperBound...].split(separator: "\n").first.map(String.init) ?? ""
+                if !path.isEmpty { return path }
+            }
+        }
+        return nil
+    }
+
     static func patchedFile(_ input: [String: JSONValue]) -> String? {
         let patch = input["input"]?.stringValue ?? input["patch"]?.stringValue ?? input["command"]?.stringValue
         guard let patch else { return nil }
