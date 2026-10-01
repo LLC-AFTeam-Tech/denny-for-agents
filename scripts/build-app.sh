@@ -17,6 +17,7 @@ cp "$BIN/denny-hook" "$APP/Contents/MacOS/denny-hook"
 cp -R "$BIN/DennyForAgents_DennyForAgents.bundle" "$APP/Contents/Resources/"
 cp remote/denny-hook.py "$APP/Contents/Resources/denny-hook.py"
 cp assets/AppIcon.icns "$APP/Contents/Resources/AppIcon.icns"
+cp assets/TrayIcon.png "$APP/Contents/Resources/TrayIcon.png"
 
 cat > "$APP/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>

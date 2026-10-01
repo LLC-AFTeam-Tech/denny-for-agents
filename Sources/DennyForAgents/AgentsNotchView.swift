@@ -37,11 +37,13 @@ struct AgentsNotchView: View {
                     switch model.peek {
                     case .activity(let activity)?:
                         DennyActivityView(activity: activity, reduceMotion: false)
-                            .frame(width: 168, height: 112)
+                            .frame(width: 204, height: 136)
+                            .padding(.vertical, -10)
                     case .finished(let title, let detail)?:
-                        VStack(spacing: 2) {
+                        VStack(spacing: 0) {
                             DennyRobotFaceView(model: face)
-                                .frame(width: 104, height: 72)
+                                .frame(width: 150, height: 104)
+                                .padding(.vertical, -18)
                             Text(title)
                                 .font(.system(size: 12, weight: .semibold))
                                 .foregroundColor(.white)
@@ -51,7 +53,7 @@ struct AgentsNotchView: View {
                                 .foregroundColor(.white.opacity(0.6))
                                 .lineLimit(1)
                         }
-                        .padding(.horizontal, 12)
+                        .padding(.horizontal, 10)
                     case nil:
                         EmptyView()
                     }

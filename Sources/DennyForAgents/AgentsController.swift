@@ -540,7 +540,9 @@ final class AgentsController {
         case .compact:
             size = CGSize(width: notch.width + 2 * 64, height: notch.height)
         case .peek:
-            size = CGSize(width: max(notch.width + 2 * 64, 230), height: notch.height + 120)
+            let below: CGFloat
+            if case .finished? = model.peek { below = 108 } else { below = 120 }
+            size = CGSize(width: max(notch.width + 2 * 28, 230), height: notch.height + below)
         case .expanded:
             let width = max(notch.width + 2 * 160, 540)
             size = CGSize(width: width, height: expandedHeight(width: width))

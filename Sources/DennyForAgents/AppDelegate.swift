@@ -45,7 +45,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func setUpStatusItem() {
         let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
-        item.button?.image = NSImage(systemSymbolName: "face.smiling", accessibilityDescription: "Denny for Agents")
+        if let tray = Bundle.main.image(forResource: "TrayIcon") {
+            tray.size = NSSize(width: 18, height: 18)
+            item.button?.image = tray
+        } else {
+            item.button?.image = NSImage(systemSymbolName: "face.smiling", accessibilityDescription: "Denny for Agents")
+        }
         item.button?.target = self
         item.button?.action = #selector(statusItemClicked)
         statusItem = item
