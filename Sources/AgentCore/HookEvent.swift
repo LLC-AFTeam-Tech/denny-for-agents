@@ -40,6 +40,10 @@ public struct HookEvent: Codable, Equatable, Sendable {
     public var message: String?
     public var notificationType: String?
     public var lastAssistantMessage: String?
+    /// Set by the remote (SSH) hook so the notch can say where the agent runs.
+    public var host: String?
+    /// The remote user's home, so the Mac can tell where a sent file lands.
+    public var home: String?
 
     public init(
         agent: AgentKind,
@@ -51,7 +55,9 @@ public struct HookEvent: Codable, Equatable, Sendable {
         prompt: String? = nil,
         message: String? = nil,
         notificationType: String? = nil,
-        lastAssistantMessage: String? = nil
+        lastAssistantMessage: String? = nil,
+        host: String? = nil,
+        home: String? = nil
     ) {
         self.agent = agent
         self.name = name
@@ -63,6 +69,8 @@ public struct HookEvent: Codable, Equatable, Sendable {
         self.message = message
         self.notificationType = notificationType
         self.lastAssistantMessage = lastAssistantMessage
+        self.host = host
+        self.home = home
     }
 
     private struct RawPayload: Decodable {

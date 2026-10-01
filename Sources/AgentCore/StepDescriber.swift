@@ -1,13 +1,12 @@
 import Foundation
 
-public enum UILanguage: String, Sendable {
-    case en
-    case ru
-
-    public static var current: UILanguage {
-        let first = Locale.preferredLanguages.first ?? "en"
-        return first.hasPrefix("ru") ? .ru : .en
-    }
+/// What kind of work a tool call is, for Denny's animations.
+public enum StepKind: String, Equatable, Sendable {
+    case writing
+    case running
+    case planning
+    case reading
+    case other
 }
 
 /// Turns a tool call into a short human line for the notch:
@@ -60,6 +59,16 @@ public enum StepDescriber {
         }
     }
 
+    public static func kind(toolName: String?) -> StepKind {
+        switch toolName ?? "" {
+        case "Edit", "MultiEdit", "Write", "NotebookEdit", "apply_patch": return .writing
+        case "Bash", "shell", "exec_command", "local_shell": return .running
+        case "TodoWrite", "update_plan": return .planning
+        case "Read", "Grep", "Glob", "WebSearch", "WebFetch", "web_search", "view_image": return .reading
+        default: return .other
+        }
+    }
+
     static func command(from input: [String: JSONValue]) -> String? {
         switch input["command"] {
         case .string(let text)?:
@@ -108,23 +117,25 @@ public enum StepDescriber {
 struct Texts {
     let language: UILanguage
 
-    private func pick(_ en: String, _ ru: String) -> String { language == .ru ? ru : en }
+    private func t(_ key: String, _ arguments: CVarArg...) -> String {
+        Translations.format(key, language, arguments)
+    }
 
-    func runs(_ command: String) -> String { pick("Runs \(command)", "Запускает \(command)") }
-    var runsCommand: String { pick("Runs a command", "Запускает команду") }
-    func reads(_ file: String) -> String { pick("Reads \(file)", "Читает \(file)") }
-    var aFile: String { pick("a file", "файл") }
-    func edits(_ file: String) -> String { pick("Edits \(file)", "Правит \(file)") }
-    var editsFiles: String { pick("Edits files", "Правит файлы") }
-    func searches(_ pattern: String) -> String { pick("Searches “\(pattern)”", "Ищет «\(pattern)»") }
-    var searchesCode: String { pick("Searches the code", "Ищет в коде") }
-    var searchesWeb: String { pick("Searches the web", "Ищет в интернете") }
-    func opens(_ host: String) -> String { pick("Opens \(host)", "Открывает \(host)") }
-    var startsHelper: String { pick("Starts a helper agent", "Запускает помощника") }
-    var updatesPlan: String { pick("Updates the plan", "Обновляет план") }
-    func uses(_ tool: String) -> String { pick("Uses \(tool)", "Использует \(tool)") }
-    var working: String { pick("Working…", "Работает…") }
-    var thinking: String { pick("Thinking…", "Думает…") }
-    var waitingForYou: String { pick("Waiting for you", "Ждёт тебя") }
-    var done: String { pick("Done", "Готово") }
+    func runs(_ command: String) -> String { t("step.runs", command) }
+    var runsCommand: String { t("step.runsCommand") }
+    func reads(_ file: String) -> String { t("step.reads", file) }
+    var aFile: String { t("step.aFile") }
+    func edits(_ file: String) -> String { t("step.edits", file) }
+    var editsFiles: String { t("step.editsFiles") }
+    func searches(_ pattern: String) -> String { t("step.searches", pattern) }
+    var searchesCode: String { t("step.searchesCode") }
+    var searchesWeb: String { t("step.searchesWeb") }
+    func opens(_ host: String) -> String { t("step.opens", host) }
+    var startsHelper: String { t("step.startsHelper") }
+    var updatesPlan: String { t("step.updatesPlan") }
+    func uses(_ tool: String) -> String { t("step.uses", tool) }
+    var working: String { t("step.working") }
+    var thinking: String { t("step.thinking") }
+    var waitingForYou: String { t("step.waitingForYou") }
+    var done: String { t("step.done") }
 }

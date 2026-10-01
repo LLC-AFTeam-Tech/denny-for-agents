@@ -15,11 +15,16 @@ public struct AgentSession: Equatable, Identifiable, Sendable {
     public let agent: AgentKind
     public let sessionId: String
     public var cwd: String?
+    public var host: String?
+    public var home: String?
     public var status: SessionStatus
     public var currentStep: String?
     public var recentSteps: [String]
     public var lastMessage: String?
     public var updatedAt: Date
+    /// When the current turn began, for the timer in the closed notch.
+    public var turnStartedAt: Date?
+    public var stepKind: StepKind?
 
     public var projectName: String {
         guard let cwd, !cwd.isEmpty else { return agent.displayName }
@@ -32,6 +37,7 @@ public struct PendingApproval: Equatable, Identifiable, Sendable {
     public let sessionKey: String
     public let agent: AgentKind
     public let projectName: String
+    public let host: String?
     public let summary: String
     public let detail: String?
     public let receivedAt: Date
@@ -39,7 +45,10 @@ public struct PendingApproval: Equatable, Identifiable, Sendable {
 
 /// What Denny should do in response to a state change.
 public enum AgentStoreEffect: Equatable, Sendable {
-    case celebrate(sessionKey: String)
+    case celebrate(sessionKey: String, duration: TimeInterval?)
+    /// The agent switched to writing code or planning.
+    case startedStep(sessionKey: String, kind: StepKind)
+    case turnStarted(sessionKey: String)
     case needsAttention(approvalId: String)
 }
 
@@ -103,13 +112,19 @@ public struct AgentStore: Equatable, Sendable {
             agent: event.agent,
             sessionId: event.sessionId,
             cwd: event.cwd,
+            host: event.host,
+            home: event.home,
             status: .idle,
             currentStep: nil,
             recentSteps: [],
             lastMessage: nil,
-            updatedAt: now
+            updatedAt: now,
+            turnStartedAt: nil,
+            stepKind: nil
         )
         if let cwd = event.cwd { session.cwd = cwd }
+        if let host = event.host { session.host = host }
+        if let home = event.home { session.home = home }
         session.updatedAt = now
         var effects: [AgentStoreEffect] = []
 
@@ -121,8 +136,17 @@ public struct AgentStore: Equatable, Sendable {
             session.currentStep = texts.thinking
             session.recentSteps = []
             session.lastMessage = nil
+            session.turnStartedAt = now
+            session.stepKind = nil
+            effects.append(.turnStarted(sessionKey: key))
         case .preToolUse:
             let step = StepDescriber.describe(toolName: event.toolName, toolInput: event.toolInput, language: language)
+            if session.turnStartedAt == nil { session.turnStartedAt = now }
+            let kind = StepDescriber.kind(toolName: event.toolName)
+            if kind != session.stepKind, kind == .writing || kind == .planning {
+                effects.append(.startedStep(sessionKey: key, kind: kind))
+            }
+            session.stepKind = kind
             session.status = .working
             session.currentStep = step
             session.recentSteps.append(step)
@@ -141,6 +165,7 @@ public struct AgentStore: Equatable, Sendable {
                 sessionKey: key,
                 agent: event.agent,
                 projectName: session.projectName,
+                host: session.host,
                 summary: summary,
                 detail: Self.approvalDetail(event),
                 receivedAt: now
@@ -154,11 +179,14 @@ public struct AgentStore: Equatable, Sendable {
                 session.currentStep = texts.waitingForYou
             }
         case .stop, .interrupt:
+            let duration = session.turnStartedAt.map { now.timeIntervalSince($0) }
             approvals.removeAll { $0.sessionKey == key }
             session.status = .finished
             session.currentStep = texts.done
+            session.turnStartedAt = nil
+            session.stepKind = nil
             session.lastMessage = event.lastAssistantMessage
-            if event.name == .stop { effects.append(.celebrate(sessionKey: key)) }
+            if event.name == .stop { effects.append(.celebrate(sessionKey: key, duration: duration)) }
         case .sessionEnd, .other:
             break
         }
