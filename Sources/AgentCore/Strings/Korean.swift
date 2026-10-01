@@ -251,6 +251,12 @@ extension Translations {
         "relay.note.edited": "수정함: %@",
         "relay.note.ran": "실행함: %@",
         "relay.note.last": "%@의 마지막 메시지:",
-        "relay.note.next": "먼저 현재 변경 사항을 확인하고(git status, git diff) 멈춘 곳부터 이어서 해 주세요."
+        "relay.note.next": "먼저 현재 변경 사항을 확인하고(git status, git diff) 멈춘 곳부터 이어서 해 주세요.",
+
+        "stuck.title": "%@이(가) 제자리를 맴도는 것 같아요",
+        "stuck.repeatCommand": "“%2$@”을(를) %1$ld번째 실행 중",
+        "stuck.repeatEdit": "%2$@을(를) %1$ld번째 수정 중",
+        "stuck.noProgress": "%ld분 동안 작업했지만 바뀐 게 없어요",
+        "stuck.setting": "에이전트가 제자리를 맴돌면 알려 주기"
     ]
 }

@@ -181,6 +181,12 @@ final class AgentsController {
                 }
             case .startedStep(_, let kind):
                 if settings.peekOnWriting { peek(.activity(kind == .writing ? .notes : .tasks)) }
+            case .looksStuck(let key, let reason):
+                guard settings.stuckAlerts, !settings.isQuiet, let session = store.sessions[key] else { break }
+                face.playGesture(.misheard)
+                let title = L.stuckTitle(session.agent)
+                peek(.finished(title: title, detail: L.stuckReason(reason)), cooldown: Self.finishPeekCooldown)
+                notifier.post(title: title, body: session.projectName + " · " + L.stuckReason(reason))
             case .turnStarted:
                 if settings.peekOnStart { peek(.activity(.notes), cooldown: Self.taskPeekCooldown) }
                 // Racing a limit: Denny buckles down at the start of each task.

@@ -251,6 +251,12 @@ extension Translations {
         "relay.note.edited": "修改过：%@",
         "relay.note.ran": "运行过：%@",
         "relay.note.last": "%@ 的最后一条消息：",
-        "relay.note.next": "先查看当前改动（git status、git diff），再从中断的地方继续。"
+        "relay.note.next": "先查看当前改动（git status、git diff），再从中断的地方继续。",
+
+        "stuck.title": "%@ 好像在原地打转",
+        "stuck.repeatCommand": "第 %1$ld 次运行“%2$@”",
+        "stuck.repeatEdit": "第 %1$ld 次修改 %2$@",
+        "stuck.noProgress": "工作了 %ld 分钟却没有任何改动",
+        "stuck.setting": "代理原地打转时提醒我"
     ]
 }

@@ -763,3 +763,49 @@ final class RelayTests: XCTestCase {
         XCTAssertTrue(note.hasSuffix("then carry on from where it stopped."))
     }
 }
+
+final class StuckDetectorTests: XCTestCase {
+    private let t0 = Date(timeIntervalSince1970: 100_000)
+
+    private func tool(_ store: inout AgentStore, _ name: String, _ input: [String: JSONValue], at minutes: Double) -> [AgentStoreEffect] {
+        store.apply(HookEvent(agent: .claude, name: .preToolUse, sessionId: "s", toolName: name, toolInput: input),
+                    now: t0.addingTimeInterval(minutes * 60))
+    }
+
+    func testRepeatedCommandWarnsOncePerTurn() {
+        var store = AgentStore(language: .en)
+        store.apply(HookEvent(agent: .claude, name: .userPromptSubmit, sessionId: "s"), now: t0)
+        XCTAssertEqual(tool(&store, "Bash", ["command": .string("npm test")], at: 1), [])
+        _ = tool(&store, "Edit", ["file_path": .string("/a/x.ts")], at: 2)
+        XCTAssertEqual(tool(&store, "Bash", ["command": .string("npm test")], at: 3), [])
+        XCTAssertEqual(tool(&store, "Bash", ["command": .string("npm test")], at: 5),
+                       [.looksStuck(sessionKey: "claude:s", reason: .repeatedCommand(command: "npm test", times: 3))])
+        XCTAssertEqual(tool(&store, "Bash", ["command": .string("npm test")], at: 6), [])
+        store.apply(HookEvent(agent: .claude, name: .userPromptSubmit, sessionId: "s"), now: t0.addingTimeInterval(600))
+        XCTAssertTrue(store.sessions["claude:s"]?.history.isEmpty == true)
+    }
+
+    func testRepeatedEditsAndSpreadOutRepeatsAreFine() {
+        var store = AgentStore(language: .en)
+        store.apply(HookEvent(agent: .claude, name: .userPromptSubmit, sessionId: "s"), now: t0)
+        for minute in 0..<5 { _ = tool(&store, "Edit", ["file_path": .string("/a/Cart.swift")], at: Double(minute)) }
+        XCTAssertEqual(tool(&store, "Edit", ["file_path": .string("/a/Cart.swift")], at: 6),
+                       [.looksStuck(sessionKey: "claude:s", reason: .repeatedEdit(file: "Cart.swift", times: 6))])
+        var spaced = AgentStore(language: .en)
+        spaced.apply(HookEvent(agent: .claude, name: .userPromptSubmit, sessionId: "s"), now: t0)
+        for minute in [0.0, 20, 40] {
+            XCTAssertEqual(tool(&spaced, "Bash", ["command": .string("make")], at: minute), [])
+        }
+    }
+
+    func testLongBusyStretchWithoutEdits() {
+        var history: [StepRecord] = []
+        for step in 0..<31 {
+            history.append(StepRecord(at: t0.addingTimeInterval(120 + Double(step) * 20), kind: .reading, target: nil))
+        }
+        let now = t0.addingTimeInterval(21 * 60)
+        XCTAssertEqual(StuckDetector.check(history, turnStartedAt: t0, now: now), .noProgress(minutes: 21))
+        history.append(StepRecord(at: now, kind: .writing, target: "a.swift"))
+        XCTAssertNil(StuckDetector.check(history, turnStartedAt: t0, now: now))
+    }
+}

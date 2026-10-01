@@ -251,6 +251,12 @@ extension Translations {
         "relay.note.edited": "編集: %@",
         "relay.note.ran": "実行: %@",
         "relay.note.last": "%@ の最後のメッセージ:",
-        "relay.note.next": "まず現在の変更を確認し（git status、git diff）、止まったところから続けてください。"
+        "relay.note.next": "まず現在の変更を確認し（git status、git diff）、止まったところから続けてください。",
+
+        "stuck.title": "%@ が堂々巡りしているようです",
+        "stuck.repeatCommand": "「%2$@」を %1$ld 回目の実行中",
+        "stuck.repeatEdit": "%2$@ を %1$ld 回目の編集中",
+        "stuck.noProgress": "%ld 分作業して変更が一つもありません",
+        "stuck.setting": "エージェントが堂々巡りしたら知らせる"
     ]
 }

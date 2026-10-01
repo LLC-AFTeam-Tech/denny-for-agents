@@ -29,6 +29,11 @@ public struct AgentSession: Equatable, Identifiable, Sendable {
     public var lastPrompt: String?
     public var touchedFiles: [String] = []
     public var commands: [String] = []
+    /// This turn's tool calls, for spotting an agent going in circles.
+    public var history: [StepRecord] = []
+    /// Stuck warnings already given this turn.
+    public var stuckWarned: Set<String> = []
+    public static let maxHistory = 80
 
     public static let maxTouched = 20
     public static let maxCommands = 10
@@ -81,6 +86,8 @@ public enum AgentStoreEffect: Equatable, Sendable {
     /// The agent switched to writing code or planning.
     case startedStep(sessionKey: String, kind: StepKind)
     case turnStarted(sessionKey: String)
+    /// The agent seems to be going in circles.
+    case looksStuck(sessionKey: String, reason: StuckReason)
     case needsAttention(approvalId: String)
 }
 
@@ -174,6 +181,8 @@ public struct AgentStore: Equatable, Sendable {
             if let prompt = event.prompt, !prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                 session.lastPrompt = prompt
             }
+            session.history = []
+            session.stuckWarned = []
             effects.append(.turnStarted(sessionKey: key))
         case .preToolUse:
             let step = StepDescriber.describe(toolName: event.toolName, toolInput: event.toolInput, language: language)
@@ -184,6 +193,16 @@ public struct AgentStore: Equatable, Sendable {
             }
             session.stepKind = kind
             session.remember(toolName: event.toolName, input: event.toolInput ?? [:])
+            session.history.append(StepRecord(at: now, kind: kind, target: StuckDetector.target(toolName: event.toolName,
+                                                                                               input: event.toolInput ?? [:])))
+            if session.history.count > AgentSession.maxHistory {
+                session.history.removeFirst(session.history.count - AgentSession.maxHistory)
+            }
+            if let reason = StuckDetector.check(session.history, turnStartedAt: session.turnStartedAt, now: now),
+               !session.stuckWarned.contains(reason.id) {
+                session.stuckWarned.insert(reason.id)
+                effects.append(.looksStuck(sessionKey: key, reason: reason))
+            }
             session.status = .working
             session.currentStep = step
             session.recentSteps.append(step)

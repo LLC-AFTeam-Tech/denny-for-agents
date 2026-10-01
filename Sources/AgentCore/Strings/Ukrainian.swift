@@ -251,6 +251,12 @@ extension Translations {
         "relay.note.edited": "редагував: %@",
         "relay.note.ran": "запускав: %@",
         "relay.note.last": "Останнє повідомлення %@:",
-        "relay.note.next": "Спершу переглянь поточні зміни (git status, git diff), потім продовжуй з того місця, де зупинилися."
+        "relay.note.next": "Спершу переглянь поточні зміни (git status, git diff), потім продовжуй з того місця, де зупинилися.",
+
+        "stuck.title": "%@, здається, ходить по колу",
+        "stuck.repeatCommand": "Уже %1$ld-й раз запускає «%2$@»",
+        "stuck.repeatEdit": "Редагує %2$@ уже %1$ld-й раз",
+        "stuck.noProgress": "%ld хв працює й нічого не змінює",
+        "stuck.setting": "Попереджати, коли агент ходить по колу"
     ]
 }

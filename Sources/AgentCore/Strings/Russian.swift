@@ -251,6 +251,12 @@ extension Translations {
         "relay.note.edited": "правил: %@",
         "relay.note.ran": "запускал: %@",
         "relay.note.last": "Последнее сообщение %@:",
-        "relay.note.next": "Сначала посмотри текущие изменения (git status, git diff), потом продолжай с того места, где остановились."
+        "relay.note.next": "Сначала посмотри текущие изменения (git status, git diff), потом продолжай с того места, где остановились.",
+
+        "stuck.title": "%@, кажется, ходит по кругу",
+        "stuck.repeatCommand": "В %1$ld-й раз запускает «%2$@»",
+        "stuck.repeatEdit": "Правит %2$@ уже %1$ld-й раз",
+        "stuck.noProgress": "%ld мин работает и ничего не меняет",
+        "stuck.setting": "Предупреждать, когда агент ходит по кругу"
     ]
 }

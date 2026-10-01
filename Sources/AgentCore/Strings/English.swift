@@ -260,6 +260,12 @@ extension Translations {
         "relay.note.edited": "edited: %@",
         "relay.note.ran": "ran: %@",
         "relay.note.last": "Last message from %@:",
-        "relay.note.next": "First look at the current changes (git status, git diff), then carry on from where it stopped."
+        "relay.note.next": "First look at the current changes (git status, git diff), then carry on from where it stopped.",
+
+        "stuck.title": "%@ seems to be going in circles",
+        "stuck.repeatCommand": "Running “%2$@” for the %1$ld time",
+        "stuck.repeatEdit": "Editing %2$@ for the %1$ld time",
+        "stuck.noProgress": "%ld min of work without a single change",
+        "stuck.setting": "Warn when an agent goes in circles"
     ]
 }

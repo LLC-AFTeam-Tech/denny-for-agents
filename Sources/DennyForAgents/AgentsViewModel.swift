@@ -289,6 +289,15 @@ struct L {
     static var relayLater: String { t("relay.later") }
     static func relayCopied(_ agent: AgentKind) -> String { t("relay.copied", agent.displayName) }
     static func relayHandoff(_ agent: AgentKind) -> String { t("relay.handoff", agent.displayName) }
+    static func stuckTitle(_ agent: AgentKind) -> String { t("stuck.title", agent.displayName) }
+    static func stuckReason(_ reason: StuckReason) -> String {
+        switch reason {
+        case .repeatedCommand(let command, let times): return t("stuck.repeatCommand", times, command)
+        case .repeatedEdit(let file, let times): return t("stuck.repeatEdit", times, file)
+        case .noProgress(let minutes): return t("stuck.noProgress", minutes)
+        }
+    }
+    static var stuckSetting: String { t("stuck.setting") }
     static var quietOn: String { t("quiet.on") }
     static func quietActive(_ time: String) -> String { t("quiet.active", time) }
     static var refreshNow: String { t("quick.refresh") }

@@ -43,6 +43,10 @@ final class AppSettings: ObservableObject {
     @Published var keepAwakeLidClosed: Bool {
         didSet { defaults.set(keepAwakeLidClosed, forKey: "keepAwakeLidClosed") }
     }
+    /// Warn when an agent seems to be going in circles.
+    @Published var stuckAlerts: Bool {
+        didSet { defaults.set(stuckAlerts, forKey: "stuckAlerts") }
+    }
     /// Quiet mode: no peeks and no notifications until this moment.
     @Published var quietUntil: Date?
     /// nil follows the system language. Applied on the next launch.
@@ -65,6 +69,7 @@ final class AppSettings: ObservableObject {
         keepAwake = defaults.object(forKey: "keepAwake") as? Bool ?? true
         awakeUntil = (defaults.object(forKey: "awakeUntil") as? Double).map(Date.init(timeIntervalSince1970:))
         keepAwakeLidClosed = defaults.bool(forKey: "keepAwakeLidClosed")
+        stuckAlerts = defaults.object(forKey: "stuckAlerts") as? Bool ?? true
         language = defaults.string(forKey: "language").flatMap(UILanguage.init(rawValue:))
     }
 

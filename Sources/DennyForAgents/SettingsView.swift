@@ -409,6 +409,9 @@ struct SettingsView: View {
             }
             .labelsHidden()
         }
+        PanelCard {
+            Toggle(L.stuckSetting, isOn: $settings.stuckAlerts)
+        }
         PanelCard(L.alertLimit) {
             Picker(L.alertLimit, selection: $model.alerts.limitPercent) {
                 Text(L.off).tag(Int?.none)

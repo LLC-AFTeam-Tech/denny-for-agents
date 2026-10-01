@@ -251,6 +251,12 @@ extension Translations {
         "relay.note.edited": "modifié : %@",
         "relay.note.ran": "exécuté : %@",
         "relay.note.last": "Dernier message de %@ :",
-        "relay.note.next": "Regarde d'abord les changements en cours (git status, git diff), puis reprends là où ça s'est arrêté."
+        "relay.note.next": "Regarde d'abord les changements en cours (git status, git diff), puis reprends là où ça s'est arrêté.",
+
+        "stuck.title": "%@ semble tourner en rond",
+        "stuck.repeatCommand": "Lance « %2$@ » pour la %1$ldᵉ fois",
+        "stuck.repeatEdit": "Modifie %2$@ pour la %1$ldᵉ fois",
+        "stuck.noProgress": "%ld min de travail sans le moindre changement",
+        "stuck.setting": "Prévenir quand un agent tourne en rond"
     ]
 }
