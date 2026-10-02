@@ -44,6 +44,8 @@ public struct HookEvent: Codable, Equatable, Sendable {
     public var host: String?
     /// The remote user's home, so the Mac can tell where a sent file lands.
     public var home: String?
+    /// Files saved by the hook right before a destructive command.
+    public var snapshot: SafetySnapshot?
 
     public init(
         agent: AgentKind,
@@ -57,7 +59,8 @@ public struct HookEvent: Codable, Equatable, Sendable {
         notificationType: String? = nil,
         lastAssistantMessage: String? = nil,
         host: String? = nil,
-        home: String? = nil
+        home: String? = nil,
+        snapshot: SafetySnapshot? = nil
     ) {
         self.agent = agent
         self.name = name
@@ -71,6 +74,7 @@ public struct HookEvent: Codable, Equatable, Sendable {
         self.lastAssistantMessage = lastAssistantMessage
         self.host = host
         self.home = home
+        self.snapshot = snapshot
     }
 
     private struct RawPayload: Decodable {

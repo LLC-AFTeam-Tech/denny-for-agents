@@ -29,6 +29,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         setUpStatusItem()
         controller.onOpenSettings = { [weak self] in self?.openSettings() }
         settingsModel.serverLoads = { [weak self] in self?.controller.serverLoads ?? [] }
+        settingsModel.safetySnapshots = { [weak self] in self?.controller.safetySnapshots ?? [] }
+        settingsModel.undoSnapshot = { [weak self] notice in self?.controller.undo(notice) }
+        settingsModel.clearSnapshots = { [weak self] in
+            self?.controller.clearSnapshots()
+            self?.settingsModel.objectWillChange.send()
+        }
         controller.start()
         AppUpdater.shared.onNewVersion = { [weak self] version in
             self?.controller.notifier.post(title: L.updateAvailable(version), body: L.updateNotifyBody)

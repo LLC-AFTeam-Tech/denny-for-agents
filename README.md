@@ -6,8 +6,8 @@
 
 **A tiny robot that lives in your MacBook's notch and looks after Claude Code and Codex.**
 
-He watches your agents work, asks before anything risky runs, warns you when one goes in circles,<br>
-and cheers when the job is done. Free, open source, and private by design.
+He watches your agents work, asks before anything risky runs, saves your files before destructive commands,<br>
+warns you when an agent goes in circles, and cheers when the job is done. Free, open source, and private by design.
 
 ![macOS 13+](https://img.shields.io/badge/macOS-13%2B-black?logo=apple)
 ![Swift](https://img.shields.io/badge/Swift-5.9-F05138?logo=swift&logoColor=white)
@@ -25,6 +25,9 @@ and cheers when the job is done. Free, open source, and private by design.
 
 ### 🛡️ The guard
 Every permission request is read before you see it. `rm -rf ~`, `curl … | sh`, `git push --force`, `sudo`, anything touching `~/.ssh` or `.env` — Denny flags it in red, puts **Deny** first and plays a warning sound. Safe requests stay calm and green, so the red ones really stand out.
+
+### 🛟 The safety net
+Right before an agent runs `rm -rf`, `git reset --hard`, `git clean -f` or `git checkout -- .`, Denny snapshots your files — uncommitted and untracked ones included. Deleted the wrong folder? **Undo** in the notch puts everything back. In a git project the snapshot lives in a hidden ref and never touches your branch, index or stash; files outside git are copied aside. Snapshots are kept for 7 days by default — choose 1, 7 or 30 days and how much space copies may take. Claude Code's own rewind only covers its file edits — not what a shell command wiped out.
 
 ### 🔁 The relay
 Claude hit its plan limit in the middle of a task? Denny offers to hand the work to Codex — or the other way round — and writes the hand-off note for you: what was asked, which files were edited, which commands ran, and the last message. One click copies it, ⌘V continues the task.
@@ -114,7 +117,7 @@ The forwarded port only listens on the server's `127.0.0.1`, and every request c
 
 No account, no analytics, no telemetry. Denny makes exactly two kinds of network requests, both to this GitHub repository and both anonymous: once a day he downloads the public price list ([`prices.json`](prices.json)) and checks for a new release. Nothing about you, your code or your usage is ever sent.
 
-Hook events travel over a local Unix socket, or through the SSH tunnel you set up yourself. Files you drop on the notch go only to the server you're working on, with your next message.
+Hook events travel over a local Unix socket, or through the SSH tunnel you set up yourself. Safety-net snapshots stay on the machine where the agent runs (`~/.denny-for-agents/safety-net`). Files you drop on the notch go only to the server you're working on, with your next message.
 
 ## The full Denny
 

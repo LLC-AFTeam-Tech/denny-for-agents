@@ -429,5 +429,159 @@ class CodexAccountTests(unittest.TestCase):
         self.assertEqual(hook.codex_reset(), {"outcome": "failed"})
 
 
+class SafetyNetTests(unittest.TestCase):
+    def setUp(self):
+        self.home = tempfile.mkdtemp()
+        hook.HOME = self.home
+        hook.BASE_DIR = os.path.join(self.home, ".denny-for-agents")
+        hook.SAFETY_DIR = os.path.join(hook.BASE_DIR, "safety-net")
+        hook.SAFETY_INDEX = os.path.join(hook.SAFETY_DIR, "index.json")
+        hook.SAFETY_SETTINGS = os.path.join(hook.SAFETY_DIR, "settings.json")
+        self.repo = os.path.join(self.home, "app")
+        os.makedirs(os.path.join(self.repo, "src"))
+        self.git("init", "-q")
+        self.write("src/main.py", "print('v1')\n")
+        self.write(".gitignore", ".env\n")
+        self.git("add", "-A")
+        self.git("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "first")
+
+    def git(self, *args):
+        import subprocess
+        return subprocess.run(["git", "-C", self.repo] + list(args), check=True, capture_output=True, text=True).stdout
+
+    def write(self, name, text):
+        path = os.path.join(self.repo, name)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as handle:
+            handle.write(text)
+
+    def read(self, name):
+        with open(os.path.join(self.repo, name)) as handle:
+            return handle.read()
+
+    def test_spots_destructive_commands(self):
+        risky = [
+            "rm -rf build", "sudo rm -f a.txt", "cd app && rm -r src", "git reset --hard HEAD~1",
+            "git clean -fd", "git checkout -- .", "git restore src/main.py", "find . -name '*.pyc' -delete",
+            "ls | xargs rm", "echo hi\nrm notes.md", "FOO=1 git -C app reset --hard",
+        ]
+        safe = ["ls -la", "git status", "git restore --staged a.py", "git checkout main", "echo rm -rf /",
+                "python3 - <<'EOF'\nprint(1)\nEOF", "git commit -m 'rm stuff'"]
+        for command in risky:
+            self.assertTrue(hook.risky_command(command)[0], command)
+        for command in safe:
+            self.assertFalse(hook.risky_command(command)[0], command)
+        self.assertEqual(hook.risky_command("rm -rf -- 'my dir' b.txt")[1], ["my dir", "b.txt"])
+
+    def test_git_snapshot_brings_back_deleted_and_changed_files(self):
+        self.write("notes.txt", "untracked but precious\n")
+        snapshot = hook.take_snapshot("rm -rf src notes.txt", self.repo, "claude")
+        self.assertTrue(snapshot["ref"].startswith("refs/denny/safety-net/"))
+        # The user's branch, index and status stay exactly as they were.
+        self.assertEqual(self.git("status", "--porcelain"), "?? notes.txt\n")
+        self.assertEqual(self.git("stash", "list"), "")
+
+        import shutil
+        shutil.rmtree(os.path.join(self.repo, "src"))
+        os.remove(os.path.join(self.repo, "notes.txt"))
+        self.write("added-later.txt", "new work\n")
+        self.git("add", "added-later.txt")
+
+        preview = hook.snapshot_preview(snapshot)
+        self.assertIn(os.path.join(self.repo, "src/main.py"), preview)
+        self.assertIn(os.path.join(self.repo, "notes.txt"), preview)
+        ok, _ = hook.restore_snapshot(snapshot)
+        self.assertTrue(ok)
+        self.assertEqual(self.read("src/main.py"), "print('v1')\n")
+        self.assertEqual(self.read("notes.txt"), "untracked but precious\n")
+        # Work done after the snapshot is left alone.
+        self.assertEqual(self.read("added-later.txt"), "new work\n")
+
+    def test_ignored_and_outside_files_are_copied(self):
+        self.write(".env", "SECRET=1\n")
+        outside = os.path.join(self.home, "data")
+        os.makedirs(outside)
+        with open(os.path.join(outside, "a.csv"), "w") as handle:
+            handle.write("1,2\n")
+        snapshot = hook.take_snapshot("rm .env ../data/*.csv", os.path.join(self.repo), "codex")
+        originals = sorted(item["original"] for item in snapshot["copies"])
+        self.assertEqual(originals, sorted([os.path.join(self.repo, ".env"), os.path.join(outside, "a.csv")]))
+        os.remove(os.path.join(self.repo, ".env"))
+        with open(os.path.join(outside, "a.csv"), "w") as handle:
+            handle.write("overwritten\n")
+        self.assertTrue(hook.restore_snapshot(snapshot)[0])
+        self.assertEqual(self.read(".env"), "SECRET=1\n")
+        with open(os.path.join(outside, "a.csv")) as handle:
+            self.assertEqual(handle.read(), "1,2\n")
+
+    def test_no_snapshot_for_safe_commands_or_nothing_to_save(self):
+        self.assertIsNone(hook.take_snapshot("git status", self.repo, "claude"))
+        plain = os.path.join(self.home, "plain")
+        os.makedirs(plain)
+        self.assertIsNone(hook.take_snapshot("rm missing.txt", plain, "claude"))
+
+    def test_old_snapshots_are_pruned_with_their_refs(self):
+        old = hook.take_snapshot("rm src/main.py", self.repo, "claude", now=1000)
+        hook.take_snapshot("rm src/main.py", self.repo, "claude")
+        ids = [item["id"] for item in hook.load_safety_index()]
+        self.assertNotIn(old["id"], ids)
+        self.assertEqual(len(ids), 1)
+        refs = self.git("for-each-ref", "--format=%(refname)", "refs/denny/")
+        self.assertNotIn(old["ref"], refs)
+
+    def test_settings_from_the_mac_set_age_and_space(self):
+        hook.save_safety_settings({"days": 1, "limitMB": 300})
+        self.assertEqual(hook.safety_settings(), (86400, 300 << 20))
+        hook.save_safety_settings({"days": "oops"})
+        self.assertEqual(hook.safety_settings(), (86400, 300 << 20))
+
+    def test_full_space_drops_the_oldest_snapshots(self):
+        hook.save_safety_settings({"days": 7, "limitMB": 100})
+        big = os.path.join(self.home, "big.bin")
+        with open(big, "wb") as handle:
+            handle.write(b"x" * (60 << 20))
+        outside = os.path.join(self.home, "plain")
+        os.makedirs(outside)
+        first = hook.take_snapshot("rm ../big.bin", outside, "claude")
+        second = hook.take_snapshot("rm ../big.bin", outside, "claude")
+        self.assertEqual(first["bytes"], 60 << 20)
+        ids = [item["id"] for item in hook.load_safety_index()]
+        self.assertEqual(ids, [second["id"]])
+        self.assertFalse(os.path.exists(os.path.join(hook.SAFETY_DIR, first["id"])))
+        with open(big, "wb") as handle:
+            handle.write(b"x" * (120 << 20))
+        self.assertIsNone(hook.take_snapshot("rm ../big.bin", outside, "claude"))
+
+    def test_clear_removes_everything(self):
+        snapshot = hook.take_snapshot("git reset --hard", self.repo, "claude")
+        stdout = sys.stdout
+        sys.stdout = io.StringIO()
+        try:
+            hook.clear_snapshots()
+        finally:
+            sys.stdout = stdout
+        self.assertEqual(hook.load_safety_index(), [])
+        self.assertNotIn(snapshot["ref"], self.git("for-each-ref", "refs/denny/"))
+
+    def test_hook_sends_snapshot_with_the_event(self):
+        denny = FakeDenny()
+        os.makedirs(hook.BASE_DIR, exist_ok=True)
+        with open(os.path.join(hook.BASE_DIR, "remote.json"), "w") as handle:
+            json.dump({"port": denny.port, "token": "t" * 48}, handle)
+        hook.CONFIG_PATH = os.path.join(hook.BASE_DIR, "remote.json")
+        stdin, stdout = sys.stdin, sys.stdout
+        sys.stdin = io.StringIO(json.dumps({"session_id": "s", "hook_event_name": "PreToolUse", "cwd": self.repo,
+                                            "tool_name": "Bash", "tool_input": {"command": "git reset --hard"}}))
+        sys.stdout = io.StringIO()
+        try:
+            hook.main(["denny-hook.py", "claude"])
+        finally:
+            sys.stdin, sys.stdout = stdin, stdout
+        denny.close()
+        snapshot = denny.requests[0]["event"]["snapshot"]
+        self.assertEqual(snapshot["command"], "git reset --hard")
+        self.assertEqual(snapshot["repo"], self.repo)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -68,6 +68,8 @@ public struct FileDelivery: Codable, Equatable, Sendable {
 
     public var id: String
     public var files: [File]
+    /// Safety-net settings chosen on the Mac, so a server's hook follows them.
+    public var safetyNet: SafetyNetSettings?
 
     public init(id: String, items: [FileOutbox.Item]) {
         self.id = id

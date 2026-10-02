@@ -857,3 +857,131 @@ final class UpdatesTests: XCTestCase {
         XCTAssertFalse(Updates.isNewer("0.1.9-beta", than: "0.2.0"))
     }
 }
+
+final class SafetyNetTests: XCTestCase {
+    private var home: URL!
+    private var repo: String!
+
+    override func setUpWithError() throws {
+        home = FileManager.default.temporaryDirectory.appendingPathComponent("denny-safety-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: home.appendingPathComponent("app/src"), withIntermediateDirectories: true)
+        // The real path, as git reports it (/var is /private/var on macOS).
+        repo = home.appendingPathComponent("app").resolvingSymlinksInPath().path
+        git("init", "-q")
+        try write("src/main.py", "print('v1')\n")
+        try write(".gitignore", ".env\n")
+        git("add", "-A")
+        git("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "first")
+    }
+
+    override func tearDownWithError() throws {
+        try? FileManager.default.removeItem(at: home)
+    }
+
+    @discardableResult
+    private func git(_ args: String...) -> String {
+        SafetyNet.git(repo, args) ?? ""
+    }
+
+    private func write(_ name: String, _ text: String) throws {
+        let path = (repo as NSString).appendingPathComponent(name)
+        try FileManager.default.createDirectory(atPath: (path as NSString).deletingLastPathComponent, withIntermediateDirectories: true)
+        try text.write(toFile: path, atomically: true, encoding: .utf8)
+    }
+
+    private func read(_ name: String) -> String? {
+        try? String(contentsOfFile: (repo as NSString).appendingPathComponent(name), encoding: .utf8)
+    }
+
+    func testSpotsDestructiveCommands() {
+        let risky = ["rm -rf build", "sudo rm -f a.txt", "cd app && rm -r src", "git reset --hard HEAD~1",
+                     "git clean -fd", "git checkout -- .", "git restore src/main.py", "find . -name '*.pyc' -delete",
+                     "ls | xargs rm", "echo hi\nrm notes.md", "FOO=1 git -C app reset --hard"]
+        let safe = ["ls -la", "git status", "git restore --staged a.py", "git checkout main", "echo rm -rf /",
+                    "python3 - <<'EOF'\nprint(1)\nEOF", "git commit -m 'rm stuff'"]
+        for command in risky { XCTAssertTrue(SafetyNet.risky(command).risky, command) }
+        for command in safe { XCTAssertFalse(SafetyNet.risky(command).risky, command) }
+        XCTAssertEqual(SafetyNet.risky("rm -rf -- 'my dir' b.txt").targets, ["my dir", "b.txt"])
+    }
+
+    func testCommandComesUnclippedFromThePayload() {
+        let long = "rm -rf " + String(repeating: "a", count: 3000)
+        let payload = try! JSONSerialization.data(withJSONObject: ["tool_input": ["command": long]])
+        XCTAssertEqual(SafetyNet.command(fromPayload: payload), long)
+        let codex = try! JSONSerialization.data(withJSONObject: ["tool_input": ["command": ["bash", "-lc", "git clean -fd"]]])
+        XCTAssertEqual(SafetyNet.command(fromPayload: codex), "git clean -fd")
+    }
+
+    func testGitSnapshotBringsBackDeletedFilesAndKeepsNewWork() throws {
+        try write("notes.txt", "untracked but precious\n")
+        let snapshot = try XCTUnwrap(SafetyNet.take(command: "rm -rf src notes.txt", cwd: repo, agent: "claude", home: home))
+        XCTAssertTrue(snapshot.ref?.hasPrefix(SafetyNet.refPrefix) == true)
+        XCTAssertEqual(git("status", "--porcelain"), "?? notes.txt")
+        XCTAssertEqual(git("stash", "list"), "")
+
+        try FileManager.default.removeItem(atPath: repo + "/src")
+        try FileManager.default.removeItem(atPath: repo + "/notes.txt")
+        try write("added-later.txt", "new work\n")
+        git("add", "added-later.txt")
+
+        XCTAssertTrue(SafetyNet.preview(snapshot).contains((repo as NSString).appendingPathComponent("notes.txt")))
+        XCTAssertTrue(SafetyNet.restore(snapshot, home: home))
+        XCTAssertEqual(read("src/main.py"), "print('v1')\n")
+        XCTAssertEqual(read("notes.txt"), "untracked but precious\n")
+        XCTAssertEqual(read("added-later.txt"), "new work\n")
+        XCTAssertEqual(SafetyNet.load(home: home).map(\.id), [snapshot.id])
+    }
+
+    func testIgnoredFilesAreCopiedAndPutBack() throws {
+        try write(".env", "SECRET=1\n")
+        let snapshot = try XCTUnwrap(SafetyNet.take(command: "rm .env", cwd: repo, agent: "codex", home: home))
+        XCTAssertEqual(snapshot.copies.map(\.original), [(repo as NSString).appendingPathComponent(".env")])
+        try FileManager.default.removeItem(atPath: repo + "/.env")
+        XCTAssertTrue(SafetyNet.restore(snapshot, home: home))
+        XCTAssertEqual(read(".env"), "SECRET=1\n")
+    }
+
+    func testHarmlessCommandsTakeNoSnapshot() {
+        XCTAssertNil(SafetyNet.take(command: "git status", cwd: repo, agent: "claude", home: home))
+        let plain = home.appendingPathComponent("plain").path
+        try? FileManager.default.createDirectory(atPath: plain, withIntermediateDirectories: true)
+        XCTAssertNil(SafetyNet.take(command: "rm missing.txt", cwd: plain, agent: "claude", home: home))
+    }
+
+    func testSettingsDecideAgeAndSpace() throws {
+        SafetyNetSettings(days: 1, limitMB: 100).save(home: home)
+        XCTAssertEqual(SafetyNetSettings.load(home: home), SafetyNetSettings(days: 1, limitMB: 100))
+        let plain = home.appendingPathComponent("plain").path
+        try FileManager.default.createDirectory(atPath: plain, withIntermediateDirectories: true)
+        let big = home.appendingPathComponent("big.bin").path
+        FileManager.default.createFile(atPath: big, contents: Data(count: 60 << 20))
+        let first = try XCTUnwrap(SafetyNet.take(command: "rm ../big.bin", cwd: plain, agent: "claude", home: home))
+        let second = try XCTUnwrap(SafetyNet.take(command: "rm ../big.bin", cwd: plain, agent: "claude", home: home))
+        XCTAssertEqual(first.bytes, 60 << 20)
+        XCTAssertEqual(SafetyNet.load(home: home).map(\.id), [second.id])
+        // Older than a day: gone on the next snapshot.
+        _ = SafetyNet.take(command: "git reset --hard", cwd: repo, agent: "claude", now: Date().addingTimeInterval(2 * 86400), home: home)
+        XCTAssertFalse(SafetyNet.load(home: home).map(\.id).contains(second.id))
+        SafetyNet.clearAll(home: home)
+        XCTAssertTrue(SafetyNet.load(home: home).isEmpty)
+    }
+
+    func testServersGetTheSettingsWithFiles() throws {
+        var delivery = FileDelivery(id: "r", items: [])
+        delivery.safetyNet = SafetyNetSettings(days: 30, limitMB: 5120)
+        let json = try XCTUnwrap(JSONSerialization.jsonObject(with: JSONEncoder().encode(delivery)) as? [String: Any])
+        let settings = try XCTUnwrap(json["safetyNet"] as? [String: Any])
+        XCTAssertEqual(settings["days"] as? Int, 30)
+        XCTAssertEqual(settings["limitMB"] as? Int, 5120)
+    }
+
+    func testSnapshotTravelsWithTheEvent() throws {
+        let snapshot = SafetySnapshot(id: "x", createdAt: 1, agent: "claude", cwd: "/a", command: "rm -rf b",
+                                      repo: "/a", ref: "refs/denny/safety-net/x", copies: [], skipped: [], host: "vps")
+        let event = HookEvent(agent: .claude, name: .preToolUse, sessionId: "s", snapshot: snapshot)
+        let decoded = try JSONDecoder().decode(HookEvent.self, from: JSONEncoder().encode(event))
+        XCTAssertEqual(decoded.snapshot, snapshot)
+        var store = AgentStore(language: .en)
+        XCTAssertTrue(store.apply(decoded).contains(.snapshotTaken(sessionKey: "claude:s", snapshot: snapshot)))
+    }
+}

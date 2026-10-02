@@ -36,6 +36,12 @@ enum PeekContent: Equatable {
     case celebration(agent: AgentKind, title: String, detail: String)
 }
 
+/// A snapshot the hook just took; host is set when it lives on a server.
+struct SafetyNetNotice: Equatable {
+    let snapshot: SafetySnapshot
+    let host: String?
+}
+
 struct DropMessage: Equatable {
     var title: String
     var warning: String?
@@ -64,6 +70,8 @@ final class AgentsViewModel: ObservableObject {
     /// A short reaction clip over Denny's loop.
     @Published var reaction: DennyReactionPlay?
     @Published var relayOffer: RelayOffer?
+    /// The latest safety-net snapshot, shown as a card until hidden.
+    @Published var safetyNet: SafetyNetNotice?
     @Published var visibleCards: Set<StatsCardKind> = ViewSettings.visibleCards
     @Published var readout: ReadoutKind = ViewSettings.readout
     @Published var page: NotchPage = ViewSettings.page
@@ -318,6 +326,33 @@ struct L {
     static var lidWarning: String { t("awake.lidWarning") }
     static var lidNeedsPower: String { t("awake.lidNeedsPower") }
     static var menuSettings: String { t("settings.menu") }
+    static var safetyPeekTitle: String { t("safety.peekTitle") }
+    static var safetyCardTitle: String { t("safety.cardTitle") }
+    static var safetyCardBody: String { t("safety.cardBody") }
+    static func safetyOnServer(_ host: String) -> String { t("safety.onServer", host) }
+    static var safetyUndo: String { t("safety.undo") }
+    static var safetyCopyCommand: String { t("safety.copyCommand") }
+    static var safetyHide: String { t("safety.hide") }
+    static func safetyConfirmTitle(_ command: String) -> String { t("safety.confirmTitle", command) }
+    static func safetyConfirmBody(_ count: Int) -> String { t("safety.confirmBody", count) }
+    static var safetyConfirmRestore: String { t("safety.confirmRestore") }
+    static var safetyNothing: String { t("safety.nothing") }
+    static var safetyRestored: String { t("safety.restored") }
+    static var safetyFailed: String { t("safety.failed") }
+    static var safetyCommandCopied: String { t("safety.commandCopied") }
+    static var safetyEmpty: String { t("safety.empty") }
+    static var safetyFooter: String { t("safety.footer") }
+    static var safetyStorage: String { t("safety.storage") }
+    static var safetyKeepFor: String { t("safety.keepFor") }
+    static func safetyKeep(_ days: Int) -> String { t("safety.keep.\(days)") }
+    static var safetyLimit: String { t("safety.limit") }
+    static func safetyGB(_ gb: Int) -> String { t("safety.gb", gb) }
+    static func safetyUsed(_ size: String) -> String { t("safety.used", size) }
+    static var safetyClear: String { t("safety.clear") }
+    static var safetyClearConfirm: String { t("safety.clearConfirm") }
+    static var safetyClearBody: String { t("safety.clearBody") }
+    static var safetyDelete: String { t("safety.delete") }
+    static var safetyLimitFooter: String { t("safety.limitFooter") }
     static func settingsSection(_ section: SettingsSection) -> String { t("settings.section." + section.rawValue) }
     static var connected: String { t("settings.connected") }
     static var notConnected: String { t("settings.notConnected") }

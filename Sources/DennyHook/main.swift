@@ -12,7 +12,12 @@ let arguments = CommandLine.arguments
 guard arguments.count >= 2, let agent = AgentKind(rawValue: arguments[1]) else { exit(0) }
 
 let payload = FileHandle.standardInput.readDataToEndOfFile()
-guard let event = try? HookEvent.parse(payload, agent: agent) else { exit(0) }
+guard var event = try? HookEvent.parse(payload, agent: agent) else { exit(0) }
+// The safety net works even when Denny isn't running: the snapshot is taken
+// before the command runs, whatever happens to the notch.
+if event.name == .preToolUse {
+    event.snapshot = SafetyNet.take(command: SafetyNet.command(fromPayload: payload), cwd: event.cwd, agent: agent.rawValue)
+}
 guard let socket = UnixSocket.connect(path: BridgePaths.socket().path) else { exit(0) }
 
 let wantsDecision = event.name == .permissionRequest

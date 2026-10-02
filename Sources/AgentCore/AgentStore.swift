@@ -89,6 +89,8 @@ public enum AgentStoreEffect: Equatable, Sendable {
     /// The agent seems to be going in circles.
     case looksStuck(sessionKey: String, reason: StuckReason)
     case needsAttention(approvalId: String)
+    /// The hook saved the files right before a destructive command.
+    case snapshotTaken(sessionKey: String, snapshot: SafetySnapshot)
 }
 
 public enum AgentMood: Equatable, Sendable {
@@ -192,6 +194,7 @@ public struct AgentStore: Equatable, Sendable {
                 effects.append(.startedStep(sessionKey: key, kind: kind))
             }
             session.stepKind = kind
+            if let snapshot = event.snapshot { effects.append(.snapshotTaken(sessionKey: key, snapshot: snapshot)) }
             session.remember(toolName: event.toolName, input: event.toolInput ?? [:])
             session.history.append(StepRecord(at: now, kind: kind, target: StuckDetector.target(toolName: event.toolName,
                                                                                                input: event.toolInput ?? [:])))

@@ -201,6 +201,14 @@ final class AgentsController {
                 if let limit = model.restingLimit, limit.window.percent >= 80 {
                     react(.think)
                 }
+            case .snapshotTaken(let key, let snapshot):
+                let notice = SafetyNetNotice(snapshot: snapshot, host: store.sessions[key]?.host)
+                model.safetyNet = notice
+                if notice.host != nil {
+                    remoteSnapshots.append(notice)
+                    if remoteSnapshots.count > SafetyNet.keep { remoteSnapshots.removeFirst() }
+                }
+                peek(.finished(title: L.safetyPeekTitle, detail: snapshot.command))
             case .needsAttention(let id):
                 // Denny reacts to what is being asked: calm, wary or scared.
                 switch store.approvals.first(where: { $0.id == id })?.risk.level ?? .safe {
@@ -394,6 +402,64 @@ final class AgentsController {
         }
     }
 
+    /// Snapshots from servers seen since launch; local ones live in the index.
+    private(set) var remoteSnapshots: [SafetyNetNotice] = []
+
+    /// Newest first: this Mac's index plus what servers reported.
+    var safetySnapshots: [SafetyNetNotice] {
+        let local = SafetyNet.load().map { SafetyNetNotice(snapshot: $0, host: nil) }
+        return (local + remoteSnapshots).sorted { $0.snapshot.createdAt > $1.snapshot.createdAt }
+    }
+
+    /// A server snapshot can only be restored there: copy the command.
+    /// A local one is restored here after a confirmation.
+    func undo(_ notice: SafetyNetNotice) {
+        guard notice.host == nil else {
+            copyToPasteboard(SafetyNet.restoreCommand(notice.snapshot))
+            showDropMessage(DropMessage(title: L.safetyCommandCopied, warning: nil))
+            return
+        }
+        let snapshot = notice.snapshot
+        let paths = SafetyNet.preview(snapshot)
+        NSApp.activate(ignoringOtherApps: true)
+        guard !paths.isEmpty else {
+            let alert = NSAlert()
+            alert.messageText = L.safetyNothing
+            alert.runModal()
+            return
+        }
+        let alert = NSAlert()
+        alert.messageText = L.safetyConfirmTitle(snapshot.command)
+        alert.informativeText = L.safetyConfirmBody(paths.count)
+        alert.addButton(withTitle: L.safetyConfirmRestore)
+        alert.addButton(withTitle: L.cancel)
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let ok = SafetyNet.restore(snapshot)
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.showDropMessage(DropMessage(title: ok ? L.safetyRestored : L.safetyFailed, warning: nil))
+                self.react(ok ? .joy : .scared)
+                if ok, self.model.safetyNet?.snapshot.id == snapshot.id { self.model.safetyNet = nil }
+                self.render()
+            }
+        }
+    }
+
+    /// Deletes every snapshot on this Mac after a confirmation.
+    func clearSnapshots() {
+        NSApp.activate(ignoringOtherApps: true)
+        let alert = NSAlert()
+        alert.messageText = L.safetyClearConfirm
+        alert.informativeText = L.safetyClearBody
+        alert.addButton(withTitle: L.safetyDelete)
+        alert.addButton(withTitle: L.cancel)
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        SafetyNet.clearAll()
+        if model.safetyNet?.host == nil { model.safetyNet = nil }
+        render()
+    }
+
     func toggleQuiet() {
         settings.quietUntil = settings.isQuiet ? nil : Date().addingTimeInterval(3600)
         render()
@@ -489,6 +555,11 @@ final class AgentsController {
                 relay: { [weak self] key, limit in self?.copyRelayNote(sessionKey: key, becauseOfLimit: limit) },
                 dismissRelay: { [weak self] in
                     self?.model.relayOffer = nil
+                    self?.render()
+                },
+                undoSnapshot: { [weak self] notice in self?.undo(notice) },
+                dismissSnapshot: { [weak self] in
+                    self?.model.safetyNet = nil
                     self?.render()
                 }
             )

@@ -10,6 +10,8 @@ struct NotchActions {
     /// Copy a relay note for this session to the other agent.
     var relay: (String, Bool) -> Void = { _, _ in }
     var dismissRelay: () -> Void = {}
+    var undoSnapshot: (SafetyNetNotice) -> Void = { _ in }
+    var dismissSnapshot: () -> Void = {}
 }
 
 struct AgentsNotchView: View {
@@ -184,6 +186,9 @@ struct ExpandedContent: View {
                 RelayCard(offer: offer, now: model.now,
                           onCopy: { actions.relay(offer.sessionKey, true) }, onLater: actions.dismissRelay)
             }
+            if let notice = model.safetyNet, model.now.timeIntervalSince1970 - notice.snapshot.createdAt < 3600 {
+                SafetyNetCard(notice: notice, onUndo: { actions.undoSnapshot(notice) }, onHide: actions.dismissSnapshot)
+            }
             if model.page == .stats, StatsPage.hasContent(model.summary, visible: model.visibleCards) {
                 StatsPage(summary: model.summary, period: $model.period, visible: model.visibleCards)
             } else if !model.summary.agentsSeen.isEmpty {
@@ -310,6 +315,45 @@ struct RelayCard: View {
         }
         .padding(12)
         .background(RoundedRectangle(cornerRadius: 14).stroke(offer.to.tint.opacity(0.7), lineWidth: 1))
+    }
+}
+
+/// "Safety net": files were saved before a destructive command; one click
+/// puts them back (or copies the command for a server).
+struct SafetyNetCard: View {
+    let notice: SafetyNetNotice
+    let onUndo: () -> Void
+    let onHide: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 8) {
+                Image(systemName: "lifepreserver")
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundColor(.green)
+                Text(L.safetyCardTitle)
+                    .font(.system(size: 12, weight: .semibold))
+                Spacer()
+                Text(Fmt.time(Date(timeIntervalSince1970: notice.snapshot.createdAt)))
+                    .font(.system(size: 10))
+                    .foregroundColor(.white.opacity(0.5))
+            }
+            Text(notice.snapshot.command)
+                .font(.system(size: 11, design: .monospaced))
+                .foregroundColor(.white.opacity(0.85))
+                .lineLimit(1)
+                .truncationMode(.middle)
+            Text(notice.host.map(L.safetyOnServer) ?? L.safetyCardBody)
+                .font(.system(size: 11))
+                .foregroundColor(.white.opacity(0.6))
+            HStack(spacing: 8) {
+                NotchButton(title: notice.host == nil ? L.safetyUndo : L.safetyCopyCommand, color: .green,
+                            prominent: true, action: onUndo)
+                NotchButton(title: L.safetyHide, color: .gray, action: onHide)
+            }
+        }
+        .padding(12)
+        .background(RoundedRectangle(cornerRadius: 14).stroke(Color.green.opacity(0.6), lineWidth: 1))
     }
 }
 

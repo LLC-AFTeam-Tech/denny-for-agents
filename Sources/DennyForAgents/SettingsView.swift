@@ -3,7 +3,7 @@ import AppKit
 import SwiftUI
 
 enum SettingsSection: String, CaseIterable, Identifiable {
-    case agents, servers, load, notch, cards, alerts, language, privacy, about
+    case agents, servers, load, safetyNet, notch, cards, alerts, language, privacy, about
 
     var id: String { rawValue }
 
@@ -12,6 +12,7 @@ enum SettingsSection: String, CaseIterable, Identifiable {
         case .agents: return "cpu"
         case .servers: return "server.rack"
         case .load: return "speedometer"
+        case .safetyNet: return "lifepreserver"
         case .notch: return "rectangle.topthird.inset.filled"
         case .cards: return "square.grid.2x2"
         case .alerts: return "bell"
@@ -48,6 +49,13 @@ final class SettingsModel: ObservableObject {
     let remoteSetup: () -> (port: UInt16, token: String)?
     let remoteHosts: () -> [(name: String, lastSeen: Date)]
     var serverLoads: () -> [(host: String, system: UsageReport.System, at: Date)] = { [] }
+    var safetySnapshots: () -> [SafetyNetNotice] = { [] }
+    var undoSnapshot: (SafetyNetNotice) -> Void = { _ in }
+    var clearSnapshots: () -> Void = {}
+    /// Read by the hooks from ~/.denny-for-agents/safety-net/settings.json.
+    @Published var safetySettings = SafetyNetSettings.load() {
+        didSet { safetySettings.save() }
+    }
     private let systemStats = SystemStats()
     @Published var mac: SystemStats.Snapshot?
     @Published var servers: [ServerLoad] = []
@@ -181,6 +189,7 @@ struct SettingsView: View {
                     case .agents: agents
                     case .servers: servers
                     case .load: load
+                    case .safetyNet: safetyNet
                     case .notch: notch
                     case .cards: cards
                     case .alerts: alerts
@@ -486,6 +495,50 @@ struct SettingsView: View {
         } footer: {
             Text(L.removeAllFooter).font(.caption).foregroundColor(.secondary)
         }
+    }
+
+    @ViewBuilder private var safetyNet: some View {
+        let notices = model.safetySnapshots()
+        PanelCard(L.safetyCardTitle) {
+            if notices.isEmpty {
+                Text(L.safetyEmpty).font(.callout).foregroundColor(.secondary)
+            }
+            ForEach(Array(notices.prefix(20)), id: \.snapshot.id) { notice in
+                HStack(spacing: 10) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(notice.snapshot.command)
+                            .font(.system(size: 11, design: .monospaced))
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                        Text([Fmt.time(Date(timeIntervalSince1970: notice.snapshot.createdAt)),
+                              (notice.snapshot.cwd as NSString).lastPathComponent,
+                              notice.host].compactMap { $0 }.joined(separator: " · "))
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                    }
+                    Spacer()
+                    Button(notice.host == nil ? L.safetyUndo : L.safetyCopyCommand) { model.undoSnapshot(notice) }
+                }
+            }
+        }
+        Text(L.safetyFooter).font(.caption).foregroundColor(.secondary)
+        PanelCard(L.safetyStorage) {
+            Picker(L.safetyKeepFor, selection: $model.safetySettings.days) {
+                ForEach(SafetyNetSettings.dayChoices, id: \.self) { days in
+                    Text(L.safetyKeep(days)).tag(days)
+                }
+            }
+            Picker(L.safetyLimit, selection: $model.safetySettings.limitMB) {
+                ForEach(SafetyNetSettings.limitChoicesGB, id: \.self) { gb in
+                    Text(L.safetyGB(gb)).tag(gb * 1024)
+                }
+            }
+            Text(L.safetyUsed(ByteCountFormatter.string(fromByteCount: SafetyNet.used(SafetyNet.load()), countStyle: .file)))
+                .font(.callout)
+                .foregroundColor(.secondary)
+            Button(L.safetyClear) { model.clearSnapshots() }
+        }
+        Text(L.safetyLimitFooter).font(.caption).foregroundColor(.secondary)
     }
 
     @ViewBuilder private var about: some View {

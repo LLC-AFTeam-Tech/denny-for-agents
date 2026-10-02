@@ -12,6 +12,9 @@ hook exits 0 with no output and the agent carries on as if it weren't there.
   python3 denny-hook.py --report        # usage + plan limits as JSON (used by the Mac app)
   python3 denny-hook.py --codex-reset   # spend one Codex rate-limit reset credit
   python3 denny-hook.py --statusline    # Claude Code status line: records live plan limits
+  python3 denny-hook.py --snapshots     # safety net: snapshots taken before risky commands
+  python3 denny-hook.py --restore ID    # put the files of a snapshot back
+  python3 denny-hook.py --clear-snapshots
   python3 denny-hook.py claude|codex    # called by the agent itself
 """
 
@@ -21,6 +24,7 @@ import fcntl
 import glob
 import json
 import os
+import shlex
 import shutil
 import socket
 import subprocess
@@ -58,6 +62,12 @@ STATUSLINE_ORIGINAL = os.path.join(BASE_DIR, "statusline-original.json")
 LOCK_PATH = os.path.join(BASE_DIR, "usage-state.lock")
 REPORT_STAMP = os.path.join(BASE_DIR, "report-sent")
 REPORT_INTERVAL_SECONDS = 60
+SAFETY_DIR = os.path.join(BASE_DIR, "safety-net")
+SAFETY_INDEX = os.path.join(SAFETY_DIR, "index.json")
+SAFETY_REF = "refs/denny/safety-net/"
+SAFETY_SETTINGS = os.path.join(SAFETY_DIR, "settings.json")
+SAFETY_KEEP = 50
+SAFETY_COPY_FILES = 20000
 KEEP_SECONDS = 92 * 86400  # 13 weeks for the activity map
 RECENT_KEYS = 3000
 CLAUDE_PROJECTS = os.path.join(HOME, ".claude", "projects")
@@ -227,6 +237,7 @@ def receive_files(event, port, token):
         delivery = json.loads(line)
         if delivery.get("id") != request["id"]:
             return []
+        save_safety_settings(delivery.get("safetyNet"))
         for item in delivery.get("files") or []:
             folder = os.path.join(INBOX, safe_part(item.get("dir")))
             path = os.path.join(folder, safe_part(item.get("name")))
@@ -263,6 +274,13 @@ def run_hook(agent):
             sys.stdout.flush()
             send_report_in_background(config[0], config[1])
         return
+    if event["name"] == "PreToolUse":
+        try:
+            snapshot = take_snapshot(full_command(payload.get("tool_input")), payload.get("cwd"), agent)
+            if snapshot:
+                event["snapshot"] = snapshot
+        except Exception:
+            pass
     wants_decision = event["name"] == "PermissionRequest"
     decision = send_request(event, config[0], config[1], wants_decision)
     if wants_decision:
@@ -272,6 +290,392 @@ def run_hook(agent):
     elif event["name"] == "Stop":
         sys.stdout.flush()
         send_report_in_background(config[0], config[1])
+
+
+# ---------------------------------------------------------------- safety net
+#
+# Right before an agent runs a destructive command (rm, git reset --hard,
+# git clean -f, git checkout/restore over local changes, find -delete), the
+# hook snapshots the files: inside a git repo the whole working tree,
+# untracked files included, goes into a hidden ref (refs/denny/...) without
+# touching the branch, index or stash; targets outside git or git-ignored are
+# copied aside. `--restore ID` puts them back. Mirrors AgentCore/SafetyNet.swift.
+
+def full_command(tool_input):
+    if not isinstance(tool_input, dict):
+        return None
+    command = tool_input.get("command")
+    if isinstance(command, str):
+        return command
+    if isinstance(command, list):
+        words = [word for word in command if isinstance(word, str)]
+        if len(words) == 3 and words[1] in ("-lc", "-c"):
+            return words[2]
+        return " ".join(words) if words else None
+    return None
+
+
+def command_segments(command):
+    """Words of each simple command; operators and new lines split, quotes respected."""
+    command = command.replace("\\\n", " ").replace("\n", ";")
+    lexer = shlex.shlex(command, posix=True, punctuation_chars=";&|")
+    lexer.whitespace_split = True
+    lexer.commenters = ""
+    segments, current = [], []
+    try:
+        for token in lexer:
+            if token and set(token) <= set(";&|"):
+                if current:
+                    segments.append(current)
+                current = []
+            else:
+                current.append(token)
+    except ValueError:
+        return [part.split() for part in command.replace("&", ";").replace("|", ";").split(";") if part.split()]
+    if current:
+        segments.append(current)
+    return segments
+
+
+def strip_prefixes(words):
+    index = 0
+    while index < len(words):
+        word = words[index]
+        if "=" in word and not word.startswith("-") and word.split("=", 1)[0].isidentifier():
+            index += 1
+        elif word in ("sudo", "command", "nohup", "time", "exec", "builtin"):
+            index += 1
+        else:
+            break
+    return words[index:]
+
+
+def risky_command(command):
+    """(is_risky, rm targets) for a shell command, or (False, [])."""
+    if not isinstance(command, str) or not command.strip():
+        return False, []
+    risky, targets = False, []
+    for words in command_segments(command):
+        words = strip_prefixes(words)
+        if not words:
+            continue
+        name = os.path.basename(words[0])
+        rest = words[1:]
+        if name == "xargs" and "rm" in rest:
+            risky = True
+        elif name in ("rm", "unlink", "rmdir"):
+            risky = True
+            options_done = False
+            for word in rest:
+                if not options_done and word == "--":
+                    options_done = True
+                elif options_done or not word.startswith("-"):
+                    targets.append(word)
+        elif name == "find" and "-delete" in rest:
+            risky = True
+        elif name == "git":
+            args = list(rest)
+            while args and args[0].startswith("-"):
+                args = args[2:] if args[0] in ("-C", "-c") else args[1:]
+            if not args:
+                continue
+            sub, sub_args = args[0], args[1:]
+            if sub == "reset" and "--hard" in sub_args:
+                risky = True
+            elif sub == "clean" and any(arg == "--force" or (arg.startswith("-") and not arg.startswith("--") and "f" in arg)
+                                        for arg in sub_args):
+                risky = True
+            elif sub == "checkout" and ("--" in sub_args or "." in sub_args or "-f" in sub_args or "--force" in sub_args):
+                risky = True
+            elif sub == "restore" and ("--staged" not in sub_args or "--worktree" in sub_args):
+                risky = True
+    return risky, targets
+
+
+def run_git(repo, args, env=None, timeout=60):
+    try:
+        result = subprocess.run(["git", "-C", repo] + args, capture_output=True, text=True,
+                                timeout=timeout, env=env)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return result.stdout.strip() if result.returncode == 0 else None
+
+
+def git_snapshot(repo, snapshot_id, message):
+    index = run_git(repo, ["rev-parse", "--git-path", "index"])
+    if index is None:
+        return None
+    index = os.path.join(repo, index) if not os.path.isabs(index) else index
+    os.makedirs(SAFETY_DIR, mode=0o700, exist_ok=True)
+    temp_index = os.path.join(SAFETY_DIR, "index-" + snapshot_id)
+    try:
+        if os.path.exists(index):
+            shutil.copyfile(index, temp_index)
+        env = dict(os.environ, GIT_INDEX_FILE=temp_index,
+                   GIT_AUTHOR_NAME="Denny for Agents", GIT_AUTHOR_EMAIL="denny@localhost",
+                   GIT_COMMITTER_NAME="Denny for Agents", GIT_COMMITTER_EMAIL="denny@localhost")
+        if run_git(repo, ["add", "-A"], env=env, timeout=120) is None:
+            return None
+        tree = run_git(repo, ["write-tree"], env=env)
+        if not tree:
+            return None
+        head = run_git(repo, ["rev-parse", "--verify", "-q", "HEAD"])
+        commit = run_git(repo, ["commit-tree", tree] + (["-p", head] if head else []) + ["-m", message], env=env)
+        if not commit or run_git(repo, ["update-ref", SAFETY_REF + snapshot_id, commit]) is None:
+            return None
+        return SAFETY_REF + snapshot_id
+    finally:
+        try:
+            os.remove(temp_index)
+        except OSError:
+            pass
+
+
+def tree_size(path, budget):
+    """Bytes under path, stopping once past budget (or too many files)."""
+    if os.path.islink(path) or not os.path.isdir(path):
+        try:
+            return os.lstat(path).st_size
+        except OSError:
+            return 0
+    total, count = 0, 0
+    for root, dirs, files in os.walk(path):
+        for name in files:
+            count += 1
+            try:
+                total += os.lstat(os.path.join(root, name)).st_size
+            except OSError:
+                pass
+            if total > budget or count > SAFETY_COPY_FILES:
+                return budget + 1
+    return total
+
+
+def expand_targets(targets, cwd):
+    paths = []
+    for target in targets:
+        path = os.path.expanduser(target)
+        if not os.path.isabs(path):
+            path = os.path.join(cwd, path)
+        matches = glob.glob(path) if any(char in target for char in "*?[") else [path]
+        for match in matches:
+            match = os.path.normpath(match)
+            # Real folder, name untouched: a symlink being deleted stays the symlink.
+            match = os.path.join(os.path.realpath(os.path.dirname(match)), os.path.basename(match))
+            if os.path.lexists(match) and match not in paths:
+                paths.append(match)
+    return paths
+
+
+def take_snapshot(command, cwd, agent, now=None):
+    risky, targets = risky_command(command)
+    if not risky or not isinstance(cwd, str) or not os.path.isdir(cwd):
+        return None
+    now = time.time() if now is None else now
+    snapshot_id = time.strftime("%Y%m%d-%H%M%S", time.localtime(now)) + "-" + uuid.uuid4().hex[:4]
+    short = command.strip().splitlines()[0][:200]
+    max_age, limit = safety_settings()
+    index = prune_snapshots(load_safety_index(), now, max_age)
+    repo = run_git(cwd, ["rev-parse", "--show-toplevel"])
+    ref = git_snapshot(repo, snapshot_id, "Denny safety net: " + short) if repo else None
+    copies, skipped, copied = [], [], 0
+    for path in expand_targets(targets, cwd):
+        inside_repo = ref and (path + os.sep).startswith(repo.rstrip(os.sep) + os.sep)
+        if inside_repo and run_git(repo, ["check-ignore", "-q", path]) is None:
+            continue  # tracked or untracked-but-not-ignored: already in the git snapshot
+        if path in (os.sep, HOME):
+            skipped.append(path)
+            continue
+        size = tree_size(path, limit)
+        # Oldest snapshots make room; what can't fit at all is skipped.
+        index = make_room(index, copied + size, limit)
+        if used_bytes(index) + copied + size > limit:
+            skipped.append(path)
+            continue
+        stored = os.path.join(str(len(copies)), os.path.basename(path) or "root")
+        destination = os.path.join(SAFETY_DIR, snapshot_id, stored)
+        try:
+            os.makedirs(os.path.dirname(destination), mode=0o700, exist_ok=True)
+            if os.path.isdir(path) and not os.path.islink(path):
+                shutil.copytree(path, destination, symlinks=True)
+            else:
+                shutil.copy2(path, destination, follow_symlinks=False)
+        except (OSError, shutil.Error):
+            skipped.append(path)
+            continue
+        copied += size
+        copies.append({"original": path, "stored": stored})
+    if not ref and not copies:
+        save_safety_index(index)
+        return None
+    snapshot = {"id": snapshot_id, "createdAt": now, "agent": agent, "cwd": cwd, "command": short,
+                "repo": repo if ref else None, "ref": ref, "copies": copies, "skipped": skipped,
+                "host": socket.gethostname(), "bytes": copied}
+    index.append(snapshot)
+    for item in index[:-SAFETY_KEEP]:
+        remove_snapshot(item)
+    save_safety_index(index[-SAFETY_KEEP:])
+    return snapshot
+
+
+def safety_settings():
+    """Days to keep and MB for copies, as chosen in Denny on the Mac."""
+    days, limit_mb = 7, 2048
+    try:
+        with open(SAFETY_SETTINGS) as handle:
+            data = json.load(handle)
+        days = max(int(data.get("days", days)), 1)
+        limit_mb = max(int(data.get("limitMB", limit_mb)), 100)
+    except (OSError, ValueError, TypeError, AttributeError):
+        pass
+    return days * 86400, limit_mb << 20
+
+
+def save_safety_settings(data):
+    if not isinstance(data, dict):
+        return
+    try:
+        days, limit_mb = int(data["days"]), int(data["limitMB"])
+    except (KeyError, ValueError, TypeError):
+        return
+    os.makedirs(SAFETY_DIR, mode=0o700, exist_ok=True)
+    with open(SAFETY_SETTINGS, "w") as handle:
+        json.dump({"days": days, "limitMB": limit_mb}, handle)
+
+
+def used_bytes(snapshots):
+    return sum(item.get("bytes") or 0 for item in snapshots)
+
+
+def remove_snapshot(item):
+    if item.get("repo") and item.get("ref"):
+        run_git(item["repo"], ["update-ref", "-d", item["ref"]])
+    shutil.rmtree(os.path.join(SAFETY_DIR, item["id"]), ignore_errors=True)
+
+
+def make_room(snapshots, needed, limit):
+    """Drops the oldest snapshots until `needed` more bytes fit under the limit."""
+    kept = list(snapshots)
+    while kept and needed <= limit and used_bytes(kept) + needed > limit:
+        remove_snapshot(kept.pop(0))
+    return kept
+
+
+def clear_snapshots():
+    for item in load_safety_index():
+        remove_snapshot(item)
+    save_safety_index([])
+    print("All snapshots deleted.")
+    return 0
+
+
+def load_safety_index():
+    try:
+        with open(SAFETY_INDEX) as handle:
+            data = json.load(handle)
+        return [item for item in data.get("snapshots", []) if isinstance(item, dict) and item.get("id")]
+    except (OSError, ValueError, AttributeError):
+        return []
+
+
+def save_safety_index(snapshots):
+    os.makedirs(SAFETY_DIR, mode=0o700, exist_ok=True)
+    temp = SAFETY_INDEX + ".tmp"
+    with open(temp, "w") as handle:
+        json.dump({"version": 1, "snapshots": snapshots}, handle, indent=1)
+    os.replace(temp, SAFETY_INDEX)
+
+
+def prune_snapshots(snapshots, now, max_age):
+    kept = []
+    for item in snapshots:
+        if now - item.get("createdAt", 0) <= max_age:
+            kept.append(item)
+        else:
+            remove_snapshot(item)
+    return kept
+
+
+def snapshot_preview(snapshot):
+    """Paths that a restore would bring back or overwrite."""
+    paths = []
+    repo, ref = snapshot.get("repo"), snapshot.get("ref")
+    if repo and ref:
+        listed = run_git(repo, ["ls-tree", "-r", "--name-only", ref]) or ""
+        changed = set((run_git(repo, ["diff", "--name-only", ref]) or "").splitlines())
+        for name in listed.splitlines():
+            if name in changed or not os.path.lexists(os.path.join(repo, name)):
+                paths.append(os.path.join(repo, name))
+    for item in snapshot.get("copies", []):
+        paths.append(item["original"])
+    return paths
+
+
+def restore_snapshot(snapshot):
+    """Puts files back. Files created after the snapshot are left alone; ones
+    that a copy would overwrite are moved aside first. Returns (ok, message)."""
+    repo, ref = snapshot.get("repo"), snapshot.get("ref")
+    if repo and ref:
+        if run_git(repo, ["restore", "--source=" + ref, "--worktree", "--overlay", "--", "."]) is None \
+                and run_git(repo, ["checkout", ref, "--", "."]) is None:
+            return False, "git could not restore the snapshot"
+    folder = os.path.join(SAFETY_DIR, snapshot["id"])
+    aside = os.path.join(folder, "replaced-" + time.strftime("%Y%m%d-%H%M%S"))
+    for index, item in enumerate(snapshot.get("copies", [])):
+        source, original = os.path.join(folder, item["stored"]), item["original"]
+        if not os.path.lexists(source):
+            continue
+        try:
+            if os.path.lexists(original):
+                os.makedirs(aside, mode=0o700, exist_ok=True)
+                shutil.move(original, os.path.join(aside, str(index)))
+            os.makedirs(os.path.dirname(original), exist_ok=True)
+            if os.path.isdir(source) and not os.path.islink(source):
+                shutil.copytree(source, original, symlinks=True)
+            else:
+                shutil.copy2(source, original, follow_symlinks=False)
+        except (OSError, shutil.Error) as error:
+            return False, "could not put back %s: %s" % (original, error)
+    return True, "restored"
+
+
+def list_snapshots():
+    snapshots = load_safety_index()
+    if not snapshots:
+        print("No snapshots yet.")
+        return 0
+    for item in reversed(snapshots):
+        when = time.strftime("%Y-%m-%d %H:%M", time.localtime(item.get("createdAt", 0)))
+        print("%s  %s  %s\n    %s" % (item["id"], when, item.get("cwd", ""), item.get("command", "")))
+    return 0
+
+
+def restore_command(snapshot_id, assume_yes):
+    snapshot = next((item for item in load_safety_index() if item["id"] == snapshot_id), None)
+    if snapshot is None:
+        print("No snapshot %s. See --snapshots." % snapshot_id)
+        return 1
+    paths = snapshot_preview(snapshot)
+    print("Snapshot %s before: %s" % (snapshot_id, snapshot.get("command", "")))
+    print("%d path(s) will be put back or overwritten:" % len(paths))
+    for path in paths[:30]:
+        print("  " + path)
+    if len(paths) > 30:
+        print("  … and %d more" % (len(paths) - 30))
+    if not paths:
+        print("Nothing differs from the snapshot.")
+        return 0
+    if not assume_yes:
+        try:
+            answer = input("Changes made to these files after the snapshot will be lost. Restore? [y/N] ")
+        except EOFError:
+            answer = ""
+        if answer.strip().lower() not in ("y", "yes", "д", "да"):
+            print("Cancelled.")
+            return 1
+    ok, message = restore_snapshot(snapshot)
+    print(message)
+    return 0 if ok else 1
 
 
 # ---------------------------------------------------------------- usage report
@@ -1076,6 +1480,16 @@ def main(argv):
     if "--codex-reset" in argv:
         sys.stdout.write(json.dumps(codex_reset()) + "\n")
         return 0
+    if "--clear-snapshots" in argv:
+        return clear_snapshots()
+    if "--snapshots" in argv:
+        return list_snapshots()
+    if "--restore" in argv:
+        position = argv.index("--restore")
+        if position + 1 >= len(argv):
+            print(__doc__)
+            return 2
+        return restore_command(argv[position + 1], "--yes" in argv)
     if "--report" in argv:
         sys.stdout.write(json.dumps(build_report()) + "\n")
         return 0

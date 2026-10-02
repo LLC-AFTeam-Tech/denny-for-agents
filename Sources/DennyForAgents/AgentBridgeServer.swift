@@ -81,7 +81,9 @@ final class AgentBridgeServer {
                 self.onEvent?(request.event, nil)
                 return self.onFilesRequest?(request.event) ?? []
             }
-            if let line = try? BridgeCodec.encodeLine(FileDelivery(id: request.id, items: items)) {
+            var delivery = FileDelivery(id: request.id, items: items)
+            delivery.safetyNet = SafetyNetSettings.load()
+            if let line = try? BridgeCodec.encodeLine(delivery) {
                 client.write(line)
             }
             return
