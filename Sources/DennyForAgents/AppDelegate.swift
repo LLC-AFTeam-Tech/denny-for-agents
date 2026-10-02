@@ -30,6 +30,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         controller.onOpenSettings = { [weak self] in self?.openSettings() }
         settingsModel.serverLoads = { [weak self] in self?.controller.serverLoads ?? [] }
         controller.start()
+        AppUpdater.shared.onNewVersion = { [weak self] version in
+            self?.controller.notifier.post(title: L.updateAvailable(version), body: L.updateNotifyBody)
+        }
+        AppUpdater.shared.start()
         if !HookSetup.anyInstalled {
             DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
                 self?.askToConnect()

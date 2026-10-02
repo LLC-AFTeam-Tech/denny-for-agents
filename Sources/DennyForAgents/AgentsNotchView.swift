@@ -14,7 +14,6 @@ struct NotchActions {
 
 struct AgentsNotchView: View {
     @ObservedObject var model: AgentsViewModel
-    let face: DennyFaceViewModel
     var onAnswer: (String, ApprovalDecision) -> Void
     var onHover: (Bool) -> Void
     var onOpenFullDenny: () -> Void
@@ -36,14 +35,30 @@ struct AgentsNotchView: View {
                     Color.clear.frame(height: model.notchHeight)
                     switch model.peek {
                     case .activity(let activity)?:
-                        DennyActivityView(activity: activity, reduceMotion: false)
+                        DennyLoopView(files: [DennyClipView.workFile(activity)])
+                            .id(activity)
                             .frame(width: 204, height: 136)
                             .padding(.vertical, -10)
                     case .finished(let title, let detail)?:
                         VStack(spacing: 0) {
-                            DennyRobotFaceView(model: face)
-                                .frame(width: 150, height: 104)
-                                .padding(.vertical, -18)
+                            DennyLiveView(reaction: model.reaction)
+                                .frame(width: 170, height: 70)
+                                .padding(.vertical, 6)
+                            Text(title)
+                                .font(.system(size: 12, weight: .semibold))
+                                .foregroundColor(.white)
+                                .lineLimit(1)
+                            Text(detail)
+                                .font(.system(size: 10))
+                                .foregroundColor(.white.opacity(0.6))
+                                .lineLimit(1)
+                        }
+                        .padding(.horizontal, 10)
+                    case .celebration(let agent, let title, let detail)?:
+                        VStack(spacing: 2) {
+                            DennyClipView(file: DennyClipView.finishFile(agent))
+                                .id(title + detail)
+                                .frame(width: 200, height: 200)
                             Text(title)
                                 .font(.system(size: 12, weight: .semibold))
                                 .foregroundColor(.white)
@@ -72,8 +87,8 @@ struct AgentsNotchView: View {
 
     private var compact: some View {
         HStack {
-            DennyRobotFaceView(model: face)
-                .frame(width: 42, height: max(model.notchHeight - 4, 20))
+            DennyLiveView(reaction: model.reaction)
+                .frame(width: 68, height: max(model.notchHeight - 4, 20))
             Spacer()
             CompactReadout(model: model)
         }
@@ -82,7 +97,7 @@ struct AgentsNotchView: View {
     }
 
     @ViewBuilder private var expanded: some View {
-        let content = ExpandedContent(model: model, face: face, onAnswer: onAnswer, onOpenFullDenny: onOpenFullDenny,
+        let content = ExpandedContent(model: model, onAnswer: onAnswer, onOpenFullDenny: onOpenFullDenny,
                                       onResetCodex: onResetCodex, actions: actions)
         if model.needsScroll {
             ScrollView(.vertical, showsIndicators: true) { content }
@@ -115,7 +130,6 @@ struct AgentsNotchView: View {
 /// The open notch. Kept separate so the controller can measure its height.
 struct ExpandedContent: View {
     @ObservedObject var model: AgentsViewModel
-    let face: DennyFaceViewModel
     var onAnswer: (String, ApprovalDecision) -> Void
     var onOpenFullDenny: () -> Void
     var onResetCodex: () -> Void = {}
@@ -128,8 +142,10 @@ struct ExpandedContent: View {
         VStack(alignment: .leading, spacing: 10) {
             // The row beside the camera: Denny on the left wing, page tabs on the right.
             HStack {
-                DennyRobotFaceView(model: face)
-                    .frame(width: 42, height: max(model.notchHeight - 4, 20))
+                Group {
+                    if measuring { Color.clear } else { DennyLiveView(reaction: model.reaction) }
+                }
+                .frame(width: 68, height: max(model.notchHeight - 4, 20))
                 Spacer()
                 CompactReadout(model: model)
             }
@@ -138,7 +154,11 @@ struct ExpandedContent: View {
             HStack(spacing: 10) {
                 if let activity = model.headerActivity {
                     Group {
-                        if measuring { Color.clear } else { DennyActivityView(activity: activity, reduceMotion: false) }
+                        if measuring {
+                            Color.clear
+                        } else {
+                            DennyLoopView(files: [DennyClipView.workFile(activity)]).id(activity)
+                        }
                     }
                     .frame(width: 60, height: 40)
                 }

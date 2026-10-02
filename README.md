@@ -44,7 +44,7 @@ Approve permissions, watch your agents work, see your plan limits and spending â
 ### Homebrew
 
 ```bash
-brew install --cask OWNER/tap/denny-for-agents
+brew install --cask LLC-AFTeam-Tech/tap/denny-for-agents
 ```
 
 ### Build from source
@@ -52,7 +52,7 @@ brew install --cask OWNER/tap/denny-for-agents
 Requirements: macOS 13+, Xcode 16+ (or the Swift toolchain).
 
 ```bash
-git clone https://github.com/OWNER/denny-for-agents.git
+git clone https://github.com/LLC-AFTeam-Tech/denny-for-agents.git
 cd denny-for-agents
 swift test
 ./scripts/build-app.sh

@@ -334,7 +334,7 @@ final class RemoteBridgeTests: XCTestCase {
 final class UsageTests: XCTestCase {
     /// Verbatim shape of `denny-hook.py --report` output.
     private let pythonReport = """
-    {"host": "srv1782466", "generatedAt": 1790827119.9691796, "usage": [{"hour": 1789012800.0, "agent": "claude", \
+    {"host": "my-server", "generatedAt": 1790827119.9691796, "usage": [{"hour": 1789012800.0, "agent": "claude", \
     "model": "claude-sonnet-5", "input": 48, "cacheWrite5m": 0, "cacheWrite1h": 161628, "cacheRead": 2851992, \
     "output": 44903}], "limits": [{"agent": "claude", "plan": "Pro", "windows": [{"kind": "session", "label": null, \
     "percent": 0.0, "resetsAt": null}, {"kind": "weekly", "label": null, "percent": 0.0, "resetsAt": 1790924400}], \
@@ -389,7 +389,7 @@ final class UsageTests: XCTestCase {
     func testBridgeRequestCarriesReport() throws {
         let line = #"{"version": 1, "id": "x", "event": {"agent": "claude", "name": "Other", "sessionId": "usage-report"}, "wantsDecision": false, "token": "t", "report": "# + pythonReport + "}"
         let request = try BridgeCodec.decode(BridgeRequest.self, line: Data(line.utf8))
-        XCTAssertEqual(request.report?.host, "srv1782466")
+        XCTAssertEqual(request.report?.host, "my-server")
         XCTAssertEqual(request.event.name, .other)
     }
 }
@@ -785,6 +785,15 @@ final class StuckDetectorTests: XCTestCase {
         XCTAssertTrue(store.sessions["claude:s"]?.history.isEmpty == true)
     }
 
+    func testDifferentScriptsWithTheSameFirstLineAreFine() {
+        var store = AgentStore(language: .en)
+        store.apply(HookEvent(agent: .claude, name: .userPromptSubmit, sessionId: "s"), now: t0)
+        for (minute, script) in ["print(1)", "print(2)", "print(3)"].enumerated() {
+            let command = "cd ~/app && python3 - <<'EOF'\n\(script)\nEOF"
+            XCTAssertEqual(tool(&store, "Bash", ["command": .string(command)], at: Double(minute)), [])
+        }
+    }
+
     func testRepeatedEditsAndSpreadOutRepeatsAreFine() {
         var store = AgentStore(language: .en)
         store.apply(HookEvent(agent: .claude, name: .userPromptSubmit, sessionId: "s"), now: t0)
@@ -807,5 +816,44 @@ final class StuckDetectorTests: XCTestCase {
         XCTAssertEqual(StuckDetector.check(history, turnStartedAt: t0, now: now), .noProgress(minutes: 21))
         history.append(StepRecord(at: now, kind: .writing, target: "a.swift"))
         XCTAssertNil(StuckDetector.check(history, turnStartedAt: t0, now: now))
+    }
+}
+
+final class UpdatesTests: XCTestCase {
+    private let sha = String(repeating: "ab", count: 32)
+
+    private func release(tag: String = "v0.2.0", host: String = "github.com", notes: String? = nil,
+                         prerelease: Bool = false) -> Data {
+        let body = notes ?? "Faster notch.\n\nSHA-256: \(sha.uppercased())"
+        let json: [String: Any] = [
+            "tag_name": tag, "draft": false, "prerelease": prerelease, "body": body,
+            "assets": [["name": "DennyForAgents.zip",
+                        "browser_download_url": "https://\(host)/LLC-AFTeam-Tech/denny-for-agents/releases/download/\(tag)/DennyForAgents.zip"]]
+        ]
+        return try! JSONSerialization.data(withJSONObject: json)
+    }
+
+    func testParsesLatestRelease() {
+        let info = Updates.parseLatest(release())
+        XCTAssertEqual(info?.version, "0.2.0")
+        XCTAssertEqual(info?.sha256, sha)
+        XCTAssertEqual(info?.downloadURL.host, "github.com")
+    }
+
+    func testRejectsForeignHostsAndPrereleases() {
+        XCTAssertNil(Updates.parseLatest(release(host: "evil.example")))
+        XCTAssertNil(Updates.parseLatest(release(prerelease: true)))
+    }
+
+    func testMissingChecksumIsKeptAsNil() {
+        XCTAssertNil(Updates.parseLatest(release(notes: "No checksum here"))?.sha256)
+    }
+
+    func testVersionOrder() {
+        XCTAssertTrue(Updates.isNewer("0.10.0", than: "0.9.2"))
+        XCTAssertTrue(Updates.isNewer("v1.0", than: "0.9.9"))
+        XCTAssertTrue(Updates.isNewer("0.2.1", than: "0.2"))
+        XCTAssertFalse(Updates.isNewer("0.2.0", than: "0.2.0"))
+        XCTAssertFalse(Updates.isNewer("0.1.9-beta", than: "0.2.0"))
     }
 }

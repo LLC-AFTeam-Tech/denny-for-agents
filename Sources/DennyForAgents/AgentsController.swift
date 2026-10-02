@@ -8,7 +8,6 @@ final class AgentsController {
     static let fullDennyURL = URL(string: "https://afteam.tech/denny/?utm_source=denny-for-agents")!
 
     let model = AgentsViewModel()
-    fileprivate let face = DennyFaceViewModel()
     private var store = AgentStore()
     private let server = AgentBridgeServer()
     private let collector = UsageCollector()
@@ -25,6 +24,8 @@ final class AgentsController {
     private var peekWork: DispatchWorkItem?
     private var lastPeek = Date.distantPast
     static let peekDuration: TimeInterval = 5
+    /// The finish clips run 5 s; hold the last frame a moment.
+    static let celebrationDuration: TimeInterval = 6
     static let peekCooldown: TimeInterval = 90
     /// Every new task gets a peek; this only stops flicker on rapid messages.
     static let taskPeekCooldown: TimeInterval = 10
@@ -75,7 +76,7 @@ final class AgentsController {
         ) { [weak self] _ in
             self?.layout(animated: false)
         }
-        face.playGesture(.welcome)
+        react(.joy)
         render()
     }
 
@@ -169,11 +170,17 @@ final class AgentsController {
         for effect in effects {
             switch effect {
             case .celebrate(let key, let duration):
-                face.playGesture(.joy)
+                react(.joy)
                 collector.refresh()
                 if settings.peekOnFinish, let session = store.sessions[key] {
                     let detail = duration.map { L.finishedBody(session.projectName, Fmt.countdown($0)) } ?? session.projectName
-                    peek(.finished(title: L.finishedTitle(session.agent), detail: detail), cooldown: Self.finishPeekCooldown)
+                    let title = L.finishedTitle(session.agent)
+                    if DennyClipView.url(DennyClipView.finishFile(session.agent)) != nil {
+                        peek(.celebration(agent: session.agent, title: title, detail: detail),
+                             cooldown: Self.finishPeekCooldown, duration: Self.celebrationDuration)
+                    } else {
+                        peek(.finished(title: title, detail: detail), cooldown: Self.finishPeekCooldown)
+                    }
                 }
                 if !settings.isQuiet, notifier.settings.notifiesFinish(after: duration), let session = store.sessions[key] {
                     notifier.post(title: L.finishedTitle(session.agent),
@@ -183,7 +190,7 @@ final class AgentsController {
                 if settings.peekOnWriting { peek(.activity(kind == .writing ? .notes : .tasks)) }
             case .looksStuck(let key, let reason):
                 guard settings.stuckAlerts, !settings.isQuiet, let session = store.sessions[key] else { break }
-                face.playGesture(.misheard)
+                react(.think)
                 let title = L.stuckTitle(session.agent)
                 peek(.finished(title: title, detail: L.stuckReason(reason)), cooldown: Self.finishPeekCooldown)
                 notifier.post(title: title, body: session.projectName + " · " + L.stuckReason(reason))
@@ -191,19 +198,19 @@ final class AgentsController {
                 if settings.peekOnStart { peek(.activity(.notes), cooldown: Self.taskPeekCooldown) }
                 // Racing a limit: Denny buckles down at the start of each task.
                 if let limit = model.restingLimit, limit.window.percent >= 80 {
-                    face.playGesture(.focus)
+                    react(.think)
                 }
             case .needsAttention(let id):
                 // Denny reacts to what is being asked: calm, wary or scared.
                 switch store.approvals.first(where: { $0.id == id })?.risk.level ?? .safe {
                 case .safe, .caution:
-                    face.playGesture(.confirmation)
+                    react(.idea)
                     NSSound(named: "Tink")?.play()
                 case .danger:
-                    face.playGesture(.oops)
+                    react(.scared)
                     NSSound(named: "Funk")?.play()
                 case .critical:
-                    face.playGesture(.connectionLost)
+                    react(.scared)
                     NSSound(named: "Basso")?.play()
                 }
             }
@@ -228,8 +235,8 @@ final class AgentsController {
         store.resolveApproval(id: id)
         server.answer(id: id, decision: decision)
         switch decision {
-        case .allow: face.playGesture(.approval)
-        case .deny: face.playGesture(.oops)
+        case .allow: react(.joy)
+        case .deny: react(.scared)
         case .ask: break
         }
         render()
@@ -256,7 +263,6 @@ final class AgentsController {
     private func render() {
         model.update(from: store)
         updateAwake()
-        updateFace()
         let next = desiredMode()
         if next != model.mode {
             model.mode = next
@@ -276,7 +282,7 @@ final class AgentsController {
                 warning: target?.host.map(L.remoteCantSee)
             ))
         }
-        face.playGesture(.idea)
+        react(.idea)
     }
 
     /// Queues the files for that server and copies the paths they will have
@@ -314,7 +320,7 @@ final class AgentsController {
         let items = outbox.take(host: host)
         if !items.isEmpty {
             showDropMessage(DropMessage(title: L.delivered(items.count, host), warning: nil))
-            face.playGesture(.approval)
+            react(.joy)
         }
         return items
     }
@@ -326,7 +332,7 @@ final class AgentsController {
               !relaySeen.contains(offer.id) else { return }
         relaySeen.insert(offer.id)
         model.relayOffer = offer
-        face.playGesture(.idea)
+        react(.idea)
         let until = offer.resetsAt.map { Fmt.time(Date(timeIntervalSince1970: $0)) }
         peek(.finished(title: L.relayTitle(offer.from, until: until), detail: L.relayBody(offer.to)),
              cooldown: Self.finishPeekCooldown)
@@ -338,7 +344,7 @@ final class AgentsController {
         copyToPasteboard(Relay.note(for: session, to: to, becauseOfLimit: becauseOfLimit, language: L.language))
         model.relayOffer = nil
         showDropMessage(DropMessage(title: L.relayCopied(to), warning: nil))
-        face.playGesture(.approval)
+        react(.joy)
     }
 
     private func checkUsageAlerts() {
@@ -351,7 +357,7 @@ final class AgentsController {
             if settings.limitPercent != nil, !quiet {
                 notifier.post(title: L.renewedTitle(limit.agent), body: detail)
             }
-            face.playGesture(.joy)
+            react(.joy)
             peek(.finished(title: L.renewedTitle(limit.agent), detail: detail), cooldown: Self.finishPeekCooldown)
         }
         var tracker = notifier.tracker
@@ -359,7 +365,7 @@ final class AgentsController {
             let left = (alert.window.resetsAt ?? 0) - Date().timeIntervalSince1970
             let body = L.limitDetail(alert.window, resetsIn: left > 0 ? Fmt.countdown(left) : nil)
             if !quiet { notifier.post(title: L.limitAlertTitle(alert.agent, Int(alert.window.percent.rounded())), body: body) }
-            face.playGesture(.oops)
+            react(.scared)
         }
         let today = model.summary.spend[.today]?.cost ?? 0
         if tracker.budgetAlert(spentToday: today, settings: settings, day: FileOutbox.folder(for: Date()).prefix(8).description) {
@@ -382,7 +388,7 @@ final class AgentsController {
             guard let self else { return }
             self.model.resettingCodex = false
             self.showDropMessage(DropMessage(title: L.resetOutcome(outcome), warning: nil))
-            if outcome == "reset" { self.face.playGesture(.joy) }
+            if outcome == "reset" { self.react(.joy) }
             self.collector.refresh()
         }
     }
@@ -394,7 +400,7 @@ final class AgentsController {
 
     func refreshNow() {
         collector.refresh()
-        face.playGesture(.thinking)
+        react(.think)
     }
 
     private func copyToPasteboard(_ text: String) {
@@ -414,7 +420,8 @@ final class AgentsController {
         render()
     }
 
-    private func peek(_ content: PeekContent, cooldown: TimeInterval = AgentsController.peekCooldown) {
+    private func peek(_ content: PeekContent, cooldown: TimeInterval = AgentsController.peekCooldown,
+                      duration: TimeInterval = AgentsController.peekDuration) {
         guard !settings.isQuiet, Date().timeIntervalSince(lastPeek) > cooldown, desiredMode() != .expanded else { return }
         lastPeek = Date()
         model.peek = content
@@ -424,7 +431,7 @@ final class AgentsController {
             self?.render()
         }
         peekWork = work
-        DispatchQueue.main.asyncAfter(deadline: .now() + Self.peekDuration, execute: work)
+        DispatchQueue.main.asyncAfter(deadline: .now() + duration, execute: work)
         render()
     }
 
@@ -437,26 +444,13 @@ final class AgentsController {
         return .hidden
     }
 
-    private func updateFace() {
-        let presentation: NotchPresentationState
-        let emotion: DennyFaceEmotion
-        switch store.mood {
-        case .idle:
-            presentation = .idle
-            if model.limitAlmostUsed {
-                emotion = .unsure
-            } else {
-                emotion = store.sessions.isEmpty ? .calm : .satisfied
-            }
-        case .working:
-            presentation = .thinking
-            emotion = .thinking
-        case .needsYou:
-            presentation = .notification
-            let risk = store.approvals.map(\.risk.level).max() ?? .safe
-            emotion = risk >= .danger ? .surprise : (risk == .caution ? .unsure : .curiosity)
+    /// Main thread only.
+    private func react(_ reaction: DennyReaction) {
+        let play = DennyReactionPlay(reaction: reaction)
+        model.reaction = play
+        DispatchQueue.main.asyncAfter(deadline: .now() + DennyReaction.duration) { [weak self] in
+            if self?.model.reaction == play { self?.model.reaction = nil }
         }
-        face.update(presentationState: presentation, emotion: emotion, age: .child, mouthPose: .rest, reduceMotion: false)
     }
 
     private func handleHover(_ isHovering: Bool) {
@@ -482,7 +476,6 @@ final class AgentsController {
         let panel = NotchPanel(contentRect: notch)
         let view = AgentsNotchView(
             model: model,
-            face: face,
             onAnswer: { [weak self] id, decision in self?.answer(id: id, decision: decision) },
             onHover: { [weak self] isHovering in self?.handleHover(isHovering) },
             onOpenFullDenny: { NSWorkspace.shared.open(AgentsController.fullDennyURL) },
@@ -538,10 +531,14 @@ final class AgentsController {
         case .hidden:
             size = notch.size
         case .compact:
-            size = CGSize(width: notch.width + 2 * 64, height: notch.height)
+            size = CGSize(width: notch.width + 2 * 80, height: notch.height)
         case .peek:
             let below: CGFloat
-            if case .finished? = model.peek { below = 108 } else { below = 120 }
+            switch model.peek {
+            case .finished?: below = 116
+            case .celebration?: below = 238
+            default: below = 120
+            }
             size = CGSize(width: max(notch.width + 2 * 28, 230), height: notch.height + below)
         case .expanded:
             let width = max(notch.width + 2 * 160, 540)
@@ -572,7 +569,7 @@ extension AgentsController {
     /// Lets SwiftUI lay the open notch out at the given width and reports
     /// the height it needs, capped to most of the screen.
     fileprivate func expandedHeight(width: CGFloat) -> CGFloat {
-        let content = ExpandedContent(model: model, face: face, onAnswer: { _, _ in }, onOpenFullDenny: {}, measuring: true)
+        let content = ExpandedContent(model: model, onAnswer: { _, _ in }, onOpenFullDenny: {}, measuring: true)
             .frame(width: width)
         let measure = NSHostingView(rootView: content)
         let height = measure.fittingSize.height

@@ -15,7 +15,7 @@ let package = Package(
         .executableTarget(
             name: "DennyForAgents",
             dependencies: ["AgentCore"],
-            resources: [.copy("Resources/DennyMotion"), .copy("Resources/DennyActivities")]
+            resources: [.copy("Resources/DennyClips")]
         ),
         .testTarget(name: "AgentCoreTests", dependencies: ["AgentCore"])
     ]

@@ -127,6 +127,7 @@ final class SettingsModel: ObservableObject {
 struct SettingsView: View {
     @ObservedObject var model: SettingsModel
     @ObservedObject var settings = AppSettings.shared
+    @State private var hoveredSection: SettingsSection?
 
     /// Called by the footer buttons.
     var onFullDenny: () -> Void = {}
@@ -157,11 +158,23 @@ struct SettingsView: View {
                             .background(Capsule().fill(model.section == section ? Color(red: 0.55, green: 0.9, blue: 0.55) : .clear))
                     }
                     .buttonStyle(.plain)
-                    .help(L.settingsSection(section))
+                    .onHover { hovering in
+                        if hovering { hoveredSection = section } else if hoveredSection == section { hoveredSection = nil }
+                    }
+                    // .help() doesn't show in the tray popover, so draw the hint.
+                    .overlay(alignment: .bottom) {
+                        if hoveredSection == section {
+                            TooltipLabel(text: L.settingsSection(section))
+                                .offset(y: 30)
+                                .allowsHitTesting(false)
+                        }
+                    }
+                    .zIndex(hoveredSection == section ? 1 : 0)
                 }
             }
             .padding(4)
             .background(Capsule().fill(Color.white.opacity(0.07)))
+            .zIndex(1)
             ScrollView {
                 VStack(alignment: .leading, spacing: 14) {
                     switch model.section {
@@ -490,6 +503,9 @@ struct SettingsView: View {
             Text(L.aboutBody).font(.callout)
             Button(L.menuFullDenny) { NSWorkspace.shared.open(AgentsController.fullDennyURL) }
         }
+        PanelCard {
+            UpdateRow(updater: AppUpdater.shared)
+        }
     }
 
     // MARK: - Helpers
@@ -669,5 +685,38 @@ final class TrayPanelController: NSObject, NSPopoverDelegate {
         NSApp.activate(ignoringOtherApps: true)
         popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
         popover.contentViewController?.view.window?.makeKey()
+    }
+}
+
+/// "Check for updates" in About, and the update itself.
+struct UpdateRow: View {
+    @ObservedObject var updater: AppUpdater
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            switch updater.state {
+            case .idle:
+                Button(L.updateCheck) { updater.check() }
+            case .checking, .installing:
+                HStack(spacing: 8) {
+                    ProgressView().controlSize(.small)
+                    Text(updater.state == .checking ? L.updateChecking : L.updateInstalling).font(.callout)
+                }
+            case .upToDate:
+                Text(L.updateUpToDate).font(.callout).foregroundColor(.secondary)
+                Button(L.updateCheck) { updater.check() }
+            case .available(let release):
+                Text(L.updateAvailable(release.version)).font(.callout.weight(.semibold))
+                Button(L.updateInstall) { updater.install(release) }
+                    .buttonStyle(.borderedProminent)
+            case .homebrew(let release):
+                Text(L.updateAvailable(release.version)).font(.callout.weight(.semibold))
+                Text(L.updateHomebrew).font(.caption).foregroundColor(.secondary).textSelection(.enabled)
+            case .failed(let message):
+                Text(message).font(.callout).foregroundColor(.orange)
+                Button(L.updateCheck) { updater.check() }
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 }

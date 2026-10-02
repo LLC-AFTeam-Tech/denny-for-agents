@@ -5,7 +5,7 @@ import Foundation
 /// the repository once a day and caches it in ~/.denny-for-agents. Only a
 /// public file is fetched; nothing about your usage is sent.
 final class PriceUpdater {
-    static let source = URL(string: "https://raw.githubusercontent.com/OWNER/denny-for-agents/main/prices.json")!
+    static let source = URL(string: "https://raw.githubusercontent.com/LLC-AFTeam-Tech/denny-for-agents/main/prices.json")!
     static let interval: TimeInterval = 24 * 3600
 
     private var cache: URL { BridgePaths.directory().appendingPathComponent("prices.json") }
@@ -17,8 +17,6 @@ final class PriceUpdater {
     }
 
     private func refresh() {
-        // Not published yet: the built-in table is used.
-        guard !Self.source.absoluteString.contains("/OWNER/") else { return }
         var request = URLRequest(url: Self.source, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 20)
         request.setValue("Denny-for-Agents", forHTTPHeaderField: "User-Agent")
         URLSession.shared.dataTask(with: request) { [weak self] data, response, _ in

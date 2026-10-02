@@ -3,7 +3,7 @@ import Foundation
 public struct StepRecord: Equatable, Sendable {
     public let at: Date
     public let kind: StepKind
-    /// The command or file the step was about, if any.
+    /// The whole command or the file name the step was about, if any.
     public let target: String?
 }
 
@@ -35,7 +35,8 @@ public enum StuckDetector {
     static func target(toolName: String?, input: [String: JSONValue]) -> String? {
         switch StepDescriber.kind(toolName: toolName) {
         case .running:
-            return StepDescriber.command(from: input).map(StepDescriber.shortCommand)
+            // The whole command: heredoc scripts often share their first line.
+            return StepDescriber.command(from: input)?.trimmingCharacters(in: .whitespacesAndNewlines)
         case .writing:
             let path = input["file_path"]?.stringValue ?? input["path"]?.stringValue ?? input["notebook_path"]?.stringValue
                 ?? StepDescriber.patchedPath(input)
@@ -52,7 +53,7 @@ public enum StuckDetector {
         }
         let same = recent.filter { $0.kind == last.kind && $0.target == target }.count
         if last.kind == .running, same >= commandRepeats {
-            return .repeatedCommand(command: target, times: same)
+            return .repeatedCommand(command: StepDescriber.shortCommand(target), times: same)
         }
         if last.kind == .writing, same >= editRepeats {
             return .repeatedEdit(file: target, times: same)

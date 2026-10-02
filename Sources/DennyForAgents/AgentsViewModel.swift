@@ -32,6 +32,8 @@ enum ViewSettings {
 enum PeekContent: Equatable {
     case activity(DennyActivity)
     case finished(title: String, detail: String)
+    /// An agent finished its task: its own celebration clip.
+    case celebration(agent: AgentKind, title: String, detail: String)
 }
 
 struct DropMessage: Equatable {
@@ -59,6 +61,8 @@ final class AgentsViewModel: ObservableObject {
     @Published var period: UsagePeriod = .today
     @Published var now = Date()
     @Published var peek: PeekContent?
+    /// A short reaction clip over Denny's loop.
+    @Published var reaction: DennyReactionPlay?
     @Published var relayOffer: RelayOffer?
     @Published var visibleCards: Set<StatsCardKind> = ViewSettings.visibleCards
     @Published var readout: ReadoutKind = ViewSettings.readout
@@ -72,6 +76,7 @@ final class AgentsViewModel: ObservableObject {
     @Published var resettingCodex = false
 
     var limitAlmostUsed: Bool { tightestLimit != nil }
+
 
     /// The fullest window of any agent, whatever its level.
     var restingLimit: (agent: AgentKind, window: UsageReport.Window)? {
@@ -342,6 +347,19 @@ struct L {
     static var removeAllFooter: String { t("settings.removeAllFooter") }
     static var removeAllConfirmTitle: String { t("settings.removeAllConfirm") }
     static func version(_ value: String) -> String { t("settings.version", value) }
+    static var updateCheck: String { t("update.check") }
+    static var updateChecking: String { t("update.checking") }
+    static var updateUpToDate: String { t("update.upToDate") }
+    static func updateAvailable(_ version: String) -> String { t("update.available", version) }
+    static var updateInstall: String { t("update.install") }
+    static var updateInstalling: String { t("update.installing") }
+    static func updateFailed(_ reason: String) -> String { t("update.failed", reason) }
+    static var updateOffline: String { t("update.reason.offline") }
+    static var updateBadChecksum: String { t("update.reason.checksum") }
+    static var updateNoPermission: String { t("update.reason.folder") }
+    static var updateDownloadFailed: String { t("update.reason.download") }
+    static var updateHomebrew: String { t("update.homebrew") }
+    static var updateNotifyBody: String { t("update.notifyBody") }
     static var aboutBody: String { t("settings.about") }
     static var pageOverview: String { t("page.overview") }
     static var pageStats: String { t("page.stats") }
