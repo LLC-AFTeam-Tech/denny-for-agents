@@ -47,6 +47,10 @@ final class AppSettings: ObservableObject {
     @Published var stuckAlerts: Bool {
         didSet { defaults.set(stuckAlerts, forKey: "stuckAlerts") }
     }
+    /// Run the project's tests by itself after each task on this Mac.
+    @Published var autoRunTests: Bool {
+        didSet { defaults.set(autoRunTests, forKey: "autoRunTests") }
+    }
     /// Quiet mode: no peeks and no notifications until this moment.
     @Published var quietUntil: Date?
     /// nil follows the system language. Applied on the next launch.
@@ -70,6 +74,7 @@ final class AppSettings: ObservableObject {
         awakeUntil = (defaults.object(forKey: "awakeUntil") as? Double).map(Date.init(timeIntervalSince1970:))
         keepAwakeLidClosed = defaults.bool(forKey: "keepAwakeLidClosed")
         stuckAlerts = defaults.object(forKey: "stuckAlerts") as? Bool ?? true
+        autoRunTests = defaults.bool(forKey: "autoRunTests")
         language = defaults.string(forKey: "language").flatMap(UILanguage.init(rawValue:))
     }
 

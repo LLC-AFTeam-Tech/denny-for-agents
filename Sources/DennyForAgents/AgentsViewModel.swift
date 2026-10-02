@@ -42,6 +42,36 @@ struct SafetyNetNotice: Equatable {
     let host: String?
 }
 
+/// Tests run after a task, shown on its receipt.
+struct TestRun: Equatable {
+    enum State: Equatable {
+        case running
+        case passed
+        case failed(output: String)
+    }
+
+    let receiptId: String
+    let command: String
+    let startedAt: Date
+    var state: State
+    var duration: TimeInterval?
+}
+
+/// The other agent reviewing a task's changes, read-only.
+struct ReviewRun: Equatable {
+    enum State: Equatable {
+        case running
+        case done(text: String, findings: Int)
+        case failed(String)
+    }
+
+    let receiptId: String
+    let author: AgentKind
+    let reviewer: AgentKind
+    let startedAt: Date
+    var state: State
+}
+
 struct DropMessage: Equatable {
     var title: String
     var warning: String?
@@ -72,6 +102,14 @@ final class AgentsViewModel: ObservableObject {
     @Published var relayOffer: RelayOffer?
     /// The latest safety-net snapshot, shown as a card until hidden.
     @Published var safetyNet: SafetyNetNotice?
+    /// The last finished task's receipt, shown as a card until hidden.
+    @Published var receipt: TaskReceipt?
+    /// How the receipt's project runs its tests, if Denny can run them here.
+    @Published var receiptTestCommand: String?
+    @Published var testRun: TestRun?
+    /// The other agent, when it can review the receipt's changes here.
+    @Published var reviewer: AgentKind?
+    @Published var review: ReviewRun?
     @Published var visibleCards: Set<StatsCardKind> = ViewSettings.visibleCards
     @Published var readout: ReadoutKind = ViewSettings.readout
     @Published var page: NotchPage = ViewSettings.page
@@ -272,6 +310,57 @@ struct L {
     static var noFreshData: String { t("stats.noFresh") }
 
     static var settingsTitle: String { t("settings.title") }
+    static func phoneRequestText(_ approval: PendingApproval) -> String {
+        let place = approval.projectName + (approval.host.map { " · " + $0 } ?? "")
+        var lines = ["🛡️ " + t("phone.request", approval.agent.displayName, place), approval.summary]
+        if let detail = approval.detail, !detail.isEmpty { lines.append(detail) }
+        if approval.risk.level != .safe {
+            lines.append("⚠️ " + riskLevel(approval.risk.level) + (approval.risk.reasons.first.map { ": " + riskReason($0) } ?? ""))
+        }
+        return lines.joined(separator: "\n")
+    }
+    static var phoneAllow: String { t("phone.allow") }
+    static var phoneDeny: String { t("phone.deny") }
+    static var phoneAllowed: String { t("phone.allowed") }
+    static var phoneDenied: String { t("phone.denied") }
+    static var phoneExpired: String { t("phone.expired") }
+    static var phoneBadToken: String { t("phone.badToken") }
+    static var phonePaired: String { t("phone.paired") }
+    static var phoneTitle: String { t("phone.title") }
+    static var phoneSteps: String { t("phone.steps") }
+    static var phoneTokenPlaceholder: String { t("phone.tokenPlaceholder") }
+    static var phoneCheck: String { t("phone.check") }
+    static func phoneSendCode(_ bot: String) -> String { t("phone.sendCode", bot) }
+    static var phoneOpenBot: String { t("phone.openBot") }
+    static var phoneTopicHint: String { t("phone.topicHint") }
+    static var phoneWaiting: String { t("phone.waiting") }
+    static func phoneConnected(_ name: String, _ bot: String) -> String { t("phone.connected", name, bot) }
+    static var phoneWhenAway: String { t("phone.whenAway") }
+    static var phoneAlways: String { t("phone.always") }
+    static var phoneFinished: String { t("phone.finished") }
+    static var phoneTest: String { t("phone.test") }
+    static var phoneTestText: String { t("phone.testText") }
+    static var phoneDisconnect: String { t("phone.disconnect") }
+    static var phoneFooter: String { t("phone.footer") }
+    static var nightNewJob: String { t("night.newJob") }
+    static var nightAgent: String { t("night.agent") }
+    static var nightNoFolder: String { t("night.noFolder") }
+    static var nightChooseFolder: String { t("night.chooseFolder") }
+    static var nightWhen: String { t("night.when") }
+    static var nightWhenRenews: String { t("night.whenRenews") }
+    static var nightWhenAt: String { t("night.whenAt") }
+    static var nightQueue: String { t("night.queue") }
+    static var nightQueueTitle: String { t("night.queueTitle") }
+    static func nightWaitsUntil(_ time: String) -> String { t("night.waitsUntil", time) }
+    static var nightWaitsForLimit: String { t("night.waitsForLimit") }
+    static func nightRunning(_ time: String) -> String { t("night.running", time) }
+    static func nightDoneAt(_ time: String) -> String { t("night.doneAt", time) }
+    static func nightFailedShort(_ reason: String) -> String { t("night.failedShort", reason) }
+    static var nightFooter: String { t("night.footer") }
+    static var nightInterrupted: String { t("night.interrupted") }
+    static func nightStarted(_ agent: AgentKind, _ place: String) -> String { t("night.started", agent.displayName, place) }
+    static func nightDone(_ agent: AgentKind, _ place: String) -> String { t("night.done", agent.displayName, place) }
+    static func nightFailed(_ agent: AgentKind, _ place: String, _ reason: String) -> String { t("night.failed", agent.displayName, place, reason) }
     static func riskLevel(_ level: RiskLevel) -> String {
         switch level {
         case .safe: return t("risk.safe")
@@ -353,6 +442,36 @@ struct L {
     static var safetyClearBody: String { t("safety.clearBody") }
     static var safetyDelete: String { t("safety.delete") }
     static var safetyLimitFooter: String { t("safety.limitFooter") }
+    static var receiptTitle: String { t("receipt.title") }
+    static func receiptFiles(_ count: Int) -> String { t("receipt.files", count) }
+    static func receiptLines(_ added: Int, _ removed: Int) -> String { t("receipt.lines", added, removed) }
+    static func receiptCommands(_ count: Int) -> String { t("receipt.commands", count) }
+    static func receiptTokens(_ tokens: String) -> String { t("receipt.tokens", tokens) }
+    static func receiptCost(_ cost: String) -> String { t("receipt.cost", cost) }
+    static var receiptCopy: String { t("receipt.copy") }
+    static var receiptCopied: String { t("receipt.copied") }
+    static var receiptHide: String { t("receipt.hide") }
+    static var receiptSignature: String { t("receipt.signature") }
+    static var testsRun: String { t("tests.run") }
+    static func testsRunning(_ command: String) -> String { t("tests.running", command) }
+    static func testsPassed(_ duration: String) -> String { t("tests.passed", duration) }
+    static func testsFailed(_ duration: String) -> String { t("tests.failed", duration) }
+    static var testsSendToAgent: String { t("tests.sendToAgent") }
+    static var testsCopied: String { t("tests.copied") }
+    static func testsAgentMessage(_ command: String, _ output: String) -> String { t("tests.agentMessage", command, output) }
+    static var testsAutoSetting: String { t("tests.autoSetting") }
+    static var testsAutoFooter: String { t("tests.autoFooter") }
+    static var testsTimedOut: String { t("tests.timedOut") }
+    static func reviewButton(_ agent: AgentKind) -> String { t("review.button", agent.shortName) }
+    static func reviewRunning(_ agent: AgentKind, _ time: String) -> String { t("review.running", agent.shortName, time) }
+    static func reviewClean(_ agent: AgentKind) -> String { t("review.clean", agent.shortName) }
+    static func reviewFindings(_ agent: AgentKind, _ count: Int) -> String { t("review.findings", agent.shortName, count) }
+    static func reviewSend(_ agent: AgentKind) -> String { t("review.send", agent.shortName) }
+    static func reviewCopied(_ agent: AgentKind) -> String { t("review.copied", agent.shortName) }
+    static func reviewFailed(_ agent: AgentKind, _ reason: String) -> String { t("review.failed", agent.shortName, reason) }
+    static var reviewNoChanges: String { t("review.noChanges") }
+    static var reviewNotFound: String { t("review.notFound") }
+    static func reviewAgentMessage(_ reviewer: AgentKind, _ text: String) -> String { t("review.agentMessage", reviewer.shortName, text) }
     static func settingsSection(_ section: SettingsSection) -> String { t("settings.section." + section.rawValue) }
     static var connected: String { t("settings.connected") }
     static var notConnected: String { t("settings.notConnected") }

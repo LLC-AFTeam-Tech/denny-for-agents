@@ -18,12 +18,28 @@ guard var event = try? HookEvent.parse(payload, agent: agent) else { exit(0) }
 if event.name == .preToolUse {
     event.snapshot = SafetyNet.take(command: SafetyNet.command(fromPayload: payload), cwd: event.cwd, agent: agent.rawValue)
 }
-guard let socket = UnixSocket.connect(path: BridgePaths.socket().path) else { exit(0) }
+if event.name == .stop, agent == .claude, let transcript = TurnUsage.transcriptPath(fromPayload: payload) {
+    let usage = TurnUsage.claude(transcript: transcript)
+    if !usage.isEmpty { event.turnUsage = usage }
+}
+// Night shift: nobody is here to click Allow, so the careful policy answers
+// right away — even if Denny itself isn't running.
+event.nightShift = ProcessInfo.processInfo.environment[NightShift.environmentKey]
+var nightOutput: String?
+if event.nightShift != nil, agent == .claude, event.name == .preToolUse {
+    let risk = RiskRadar.assess(toolName: event.toolName, toolInput: event.toolInput)
+    nightOutput = NightShift.preToolUseOutput(NightShift.decision(for: risk), risk: risk)
+}
+func finish() -> Never {
+    if let nightOutput { FileHandle.standardOutput.write(Data((nightOutput + "\n").utf8)) }
+    exit(0)
+}
+guard let socket = UnixSocket.connect(path: BridgePaths.socket().path) else { finish() }
 
 let wantsDecision = event.name == .permissionRequest
 let request = BridgeRequest(id: UUID().uuidString, event: event, wantsDecision: wantsDecision)
-guard let line = try? BridgeCodec.encodeLine(request), socket.write(line) else { exit(0) }
-guard wantsDecision else { exit(0) }
+guard let line = try? BridgeCodec.encodeLine(request), socket.write(line) else { finish() }
+guard wantsDecision else { finish() }
 
 socket.setReceiveTimeout(seconds: HookInstaller.approvalWaitSeconds)
 guard let reply = socket.readLine(),

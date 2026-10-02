@@ -10,6 +10,14 @@ public enum AgentKind: String, Codable, CaseIterable, Sendable {
         case .codex: return "Codex"
         }
     }
+
+    /// For buttons: "Check with Codex".
+    public var shortName: String {
+        switch self {
+        case .claude: return "Claude"
+        case .codex: return "Codex"
+        }
+    }
 }
 
 public enum HookEventName: String, Codable, Sendable {
@@ -46,6 +54,10 @@ public struct HookEvent: Codable, Equatable, Sendable {
     public var home: String?
     /// Files saved by the hook right before a destructive command.
     public var snapshot: SafetySnapshot?
+    /// Tokens of the task that just ended (Claude Code's Stop only).
+    public var turnUsage: [UsageReport.Item]?
+    /// Set when a night-shift job started this agent: nobody is watching.
+    public var nightShift: String?
 
     public init(
         agent: AgentKind,
@@ -60,7 +72,9 @@ public struct HookEvent: Codable, Equatable, Sendable {
         lastAssistantMessage: String? = nil,
         host: String? = nil,
         home: String? = nil,
-        snapshot: SafetySnapshot? = nil
+        snapshot: SafetySnapshot? = nil,
+        turnUsage: [UsageReport.Item]? = nil,
+        nightShift: String? = nil
     ) {
         self.agent = agent
         self.name = name
@@ -75,6 +89,8 @@ public struct HookEvent: Codable, Equatable, Sendable {
         self.host = host
         self.home = home
         self.snapshot = snapshot
+        self.turnUsage = turnUsage
+        self.nightShift = nightShift
     }
 
     private struct RawPayload: Decodable {

@@ -985,3 +985,173 @@ final class SafetyNetTests: XCTestCase {
         XCTAssertTrue(store.apply(decoded).contains(.snapshotTaken(sessionKey: "claude:s", snapshot: snapshot)))
     }
 }
+
+final class TaskReceiptTests: XCTestCase {
+    func testTurnUsageCountsOnlyTheLastTask() throws {
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("turn-\(UUID().uuidString).jsonl")
+        defer { try? FileManager.default.removeItem(at: url) }
+        func assistant(_ request: String, _ output: Int, model: String = "claude-opus-5-5", read: Int = 0) -> [String: Any] {
+            ["type": "assistant", "requestId": request,
+             "message": ["model": model, "usage": ["input_tokens": 1, "output_tokens": output, "cache_read_input_tokens": read]]]
+        }
+        let entries: [[String: Any]] = [
+            ["type": "user", "message": ["role": "user", "content": "old task"]],
+            assistant("r0", 999),
+            ["type": "user", "message": ["role": "user", "content": [["type": "text", "text": "new task"]]]],
+            assistant("r1", 10, read: 100),
+            assistant("r1", 30, read: 100),
+            ["type": "user", "message": ["role": "user", "content": [["type": "tool_result", "content": "ok"]]]],
+            ["type": "user", "isMeta": true, "message": ["role": "user", "content": "<meta>"]],
+            assistant("r2", 5),
+            assistant("r3", 7, model: "claude-sonnet-5-5"),
+        ]
+        let text = try entries.map { String(decoding: try JSONSerialization.data(withJSONObject: $0), as: UTF8.self) }
+            .joined(separator: "\n") + "\n"
+        try text.write(to: url, atomically: true, encoding: .utf8)
+        let usage = TurnUsage.claude(transcript: url.path)
+        XCTAssertEqual(usage.map(\.model), ["claude-opus-5-5", "claude-sonnet-5-5"])
+        XCTAssertEqual(usage.first?.output, 35)
+        XCTAssertEqual(usage.first?.cacheRead, 100)
+        XCTAssertEqual(usage.first?.input, 2)
+        XCTAssertEqual(usage.last?.output, 7)
+    }
+
+    func testStopGivesAReceiptOfTheTask() {
+        var store = AgentStore(language: .en)
+        let t0 = Date(timeIntervalSince1970: 1000)
+        store.apply(HookEvent(agent: .claude, name: .userPromptSubmit, sessionId: "s", cwd: "/a/shop", prompt: "fix"), now: t0)
+        store.apply(HookEvent(agent: .claude, name: .preToolUse, sessionId: "s", toolName: "Edit",
+                              toolInput: ["file_path": .string("/a/shop/x.swift")]), now: t0)
+        store.apply(HookEvent(agent: .claude, name: .preToolUse, sessionId: "s", toolName: "Edit",
+                              toolInput: ["file_path": .string("/a/shop/x.swift")]), now: t0)
+        store.apply(HookEvent(agent: .claude, name: .preToolUse, sessionId: "s", toolName: "Bash",
+                              toolInput: ["command": .string("swift test")]), now: t0)
+        let usage = [UsageReport.Item(hour: 0, agent: .claude, model: "claude-opus-5-5", input: 1_000_000)]
+        let effects = store.apply(HookEvent(agent: .claude, name: .stop, sessionId: "s", turnUsage: usage),
+                                  now: t0.addingTimeInterval(90))
+        guard case .receipt(let receipt)? = effects.last else { return XCTFail("no receipt") }
+        XCTAssertEqual(receipt.files, ["/a/shop/x.swift"])
+        XCTAssertEqual(receipt.commands, 1)
+        XCTAssertEqual(receipt.duration, 90)
+        XCTAssertEqual(receipt.projectName, "shop")
+        XCTAssertEqual(receipt.cost ?? 0, 4, accuracy: 0.001)
+        // A chat with no work gives no receipt.
+        store.apply(HookEvent(agent: .claude, name: .userPromptSubmit, sessionId: "s", prompt: "hi"), now: t0)
+        XCTAssertFalse(store.apply(HookEvent(agent: .claude, name: .stop, sessionId: "s"), now: t0).contains {
+            if case .receipt = $0 { return true } else { return false }
+        })
+    }
+}
+
+final class TestRunnerTests: XCTestCase {
+    private func project(_ files: [String: String]) throws -> String {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("tests-\(UUID().uuidString)").path
+        for (name, text) in files {
+            let path = (root as NSString).appendingPathComponent(name)
+            try FileManager.default.createDirectory(atPath: (path as NSString).deletingLastPathComponent, withIntermediateDirectories: true)
+            try text.write(toFile: path, atomically: true, encoding: .utf8)
+        }
+        return root
+    }
+
+    func testFindsTheTestCommand() throws {
+        XCTAssertEqual(TestRunner.detect(cwd: try project(["Package.swift": ""]))?.command, "swift test")
+        XCTAssertEqual(TestRunner.detect(cwd: try project(["package.json": #"{"scripts":{"test":"vitest run"}}"#,
+                                                            "pnpm-lock.yaml": ""]))?.command, "pnpm test")
+        XCTAssertEqual(TestRunner.detect(cwd: try project(["package.json": #"{"scripts":{"test":"vitest"}}"#]))?.command, "npm test")
+        XCTAssertNil(TestRunner.detect(cwd: try project(["package.json":
+            #"{"scripts":{"test":"echo \"Error: no test specified\" && exit 1"}}"#])))
+        XCTAssertEqual(TestRunner.detect(cwd: try project(["Cargo.toml": ""]))?.command, "cargo test")
+        XCTAssertEqual(TestRunner.detect(cwd: try project(["pyproject.toml": "[tool.pytest.ini_options]"]))?.command, "python3 -m pytest -q")
+        XCTAssertEqual(TestRunner.detect(cwd: try project(["Makefile": "build:\n\tcc a.c\ntest:\n\t./run\n"]))?.command, "make test")
+        XCTAssertEqual(TestRunner.detect(cwd: try project([".denny-test": "# mine\nnpm run test:unit\n", "Package.swift": ""]))?.command,
+                       "npm run test:unit")
+        XCTAssertNil(TestRunner.detect(cwd: try project(["README.md": "hi"])))
+    }
+
+    func testTailKeepsTheEnd() {
+        let output = (1...100).map(String.init).joined(separator: "\n")
+        XCTAssertEqual(TestRunner.tail(output, lines: 3), "98\n99\n100")
+    }
+}
+
+final class CrossReviewTests: XCTestCase {
+    func testCountsFindings() {
+        XCTAssertEqual(CrossReview.findings(in: "- a.swift:3 off by one\n- b.swift:9 leak\nnote"), 2)
+        XCTAssertEqual(CrossReview.findings(in: "1. first\n2. second\n3.not a finding"), 2)
+        XCTAssertEqual(CrossReview.findings(in: "Everything looks right."), 0)
+    }
+
+    func testReviewersCannotEdit() {
+        let codex = CrossReview.arguments(reviewer: .codex, prompt: "p")
+        XCTAssertEqual(codex.prefix(3), ["exec", "--sandbox", "read-only"])
+        let claude = CrossReview.arguments(reviewer: .claude, prompt: "p")
+        XCTAssertTrue(claude.contains("--disallowedTools"))
+        XCTAssertTrue(claude[claude.firstIndex(of: "--disallowedTools")! + 1].contains("Edit"))
+        XCTAssertEqual(CrossReview.reviewer(for: .claude), .codex)
+    }
+
+    func testDiffHasChangedAndNewFiles() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("review-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let repo = root.resolvingSymlinksInPath().path
+        defer { try? FileManager.default.removeItem(atPath: repo) }
+        SafetyNet.git(repo, ["init", "-q"])
+        try "old\n".write(toFile: repo + "/a.txt", atomically: true, encoding: .utf8)
+        SafetyNet.git(repo, ["add", "-A"])
+        SafetyNet.git(repo, ["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "first"])
+        try "new\n".write(toFile: repo + "/a.txt", atomically: true, encoding: .utf8)
+        try "fresh\n".write(toFile: repo + "/b.txt", atomically: true, encoding: .utf8)
+        let diff = try XCTUnwrap(CrossReview.diff(cwd: repo, files: [repo + "/a.txt", repo + "/b.txt"]))
+        XCTAssertTrue(diff.contains("-old"))
+        XCTAssertTrue(diff.contains("+new"))
+        XCTAssertTrue(diff.contains("New file b.txt"))
+        let prompt = CrossReview.prompt(author: .claude, task: "почини", diff: diff)
+        XCTAssertTrue(prompt.contains("«почини»"))
+        XCTAssertTrue(prompt.contains("+new"))
+    }
+}
+
+final class NightShiftTests: XCTestCase {
+    private func limits(_ percent: Double, resetsAt: Double?) -> UsageReport.Limits {
+        try! JSONDecoder().decode(UsageReport.Limits.self, from: JSONSerialization.data(withJSONObject: [
+            "agent": "claude", "observedAt": Date().timeIntervalSince1970,
+            "windows": [["kind": "session", "percent": percent, "resetsAt": resetsAt as Any]]
+        ]))
+    }
+
+    func testWaitsForTheLimitToRenew() {
+        let now = Date(timeIntervalSince1970: 10_000)
+        let full = limits(100, resetsAt: 12_000)
+        let trigger = NightShift.renewTrigger(full)
+        XCTAssertEqual(trigger, .limitRenews(resetsAt: 12_000))
+        let job = NightJob(agent: .claude, folder: "/a", prompt: "p", trigger: trigger, createdAt: now)
+        XCTAssertFalse(NightShift.isDue(job, limits: full, now: now))
+        XCTAssertTrue(NightShift.isDue(job, limits: full, now: Date(timeIntervalSince1970: 12_100)))
+        let atThree = NightJob(agent: .codex, folder: "/a", prompt: "p", trigger: .at(Date(timeIntervalSince1970: 11_000)))
+        XCTAssertFalse(NightShift.isDue(atThree, limits: nil, now: now))
+        XCTAssertTrue(NightShift.isDue(atThree, limits: nil, now: Date(timeIntervalSince1970: 11_000)))
+    }
+
+    func testCarefulPolicy() {
+        let rm = RiskRadar.assess(toolName: "Bash", toolInput: ["command": .string("rm -rf ~")])
+        let test = RiskRadar.assess(toolName: "Bash", toolInput: ["command": .string("swift test")])
+        XCTAssertEqual(NightShift.decision(for: rm), .deny)
+        XCTAssertEqual(NightShift.decision(for: test), .allow)
+        let output = try! XCTUnwrap(NightShift.preToolUseOutput(.deny, risk: rm))
+        let json = try! JSONSerialization.jsonObject(with: Data(output.utf8)) as! [String: Any]
+        let specific = json["hookSpecificOutput"] as! [String: Any]
+        XCTAssertEqual(specific["permissionDecision"] as? String, "deny")
+        XCTAssertEqual(specific["hookEventName"] as? String, "PreToolUse")
+    }
+
+    func testJobsSurviveARestart() throws {
+        let home = FileManager.default.temporaryDirectory.appendingPathComponent("night-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: home) }
+        var job = NightJob(agent: .claude, folder: "/a", prompt: "fix the tests", trigger: .limitRenews(resetsAt: nil))
+        job.state = .failed(at: Date(timeIntervalSince1970: 5), reason: "x")
+        NightShift.save([job], home: home)
+        XCTAssertEqual(NightShift.load(home: home), [job])
+        XCTAssertEqual(NightShift.arguments(job), ["-p", "fix the tests", "--permission-mode", "acceptEdits"])
+    }
+}

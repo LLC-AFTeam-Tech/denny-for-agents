@@ -31,6 +31,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         settingsModel.serverLoads = { [weak self] in self?.controller.serverLoads ?? [] }
         settingsModel.safetySnapshots = { [weak self] in self?.controller.safetySnapshots ?? [] }
         settingsModel.undoSnapshot = { [weak self] notice in self?.controller.undo(notice) }
+        settingsModel.nightJobs = { [weak self] in self?.controller.nightJobs ?? [] }
+        settingsModel.addNightJob = { [weak self] job in self?.controller.addNightJob(job) }
+        settingsModel.removeNightJob = { [weak self] id in self?.controller.removeNightJob(id: id) }
+        settingsModel.recentFolder = { [weak self] in self?.controller.recentLocalFolder }
+        settingsModel.renewTrigger = { [weak self] agent in self?.controller.renewTrigger(for: agent) ?? .limitRenews(resetsAt: nil) }
         settingsModel.clearSnapshots = { [weak self] in
             self?.controller.clearSnapshots()
             self?.settingsModel.objectWillChange.send()

@@ -18,6 +18,14 @@ final class AgentsController {
     /// Relay offers already made or dismissed, so each shows once.
     private var relaySeen: Set<String> = []
     private var panel: NotchPanel?
+    private var swipeMonitor: Any?
+    private let telegram = TelegramBridge.shared
+    private var nightSessions: Set<String> = []
+    private var nightProcess: Process?
+    /// Queued and finished night-shift jobs, saved in ~/.denny-for-agents.
+    private(set) var nightJobs = NightShift.load()
+    private var swipe = CGVector.zero
+    private var swipeDone = false
     private var timer: Timer?
     private var hovering = false
     private var collapseWork: DispatchWorkItem?
@@ -44,6 +52,18 @@ final class AgentsController {
     private var dropObserver: AnyCancellable?
 
     func start() {
+        // A job "running" at launch was cut off by a restart or a crash.
+        for index in nightJobs.indices {
+            if case .running = nightJobs[index].state { nightJobs[index].state = .failed(at: Date(), reason: L.nightInterrupted) }
+        }
+        NightShift.save(nightJobs)
+        restoreServerReports()
+        telegram.onDecision = { [weak self] id, decision in self?.answer(id: id, decision: decision) }
+        telegram.start()
+        swipeMonitor = NSEvent.addLocalMonitorForEvents(matching: .scrollWheel) { [weak self] event in
+            guard let self else { return event }
+            return self.handleSwipe(event)
+        }
         server.onEvent = { [weak self] event, requestId in
             self?.handle(event, requestId: requestId)
         }
@@ -100,14 +120,10 @@ final class AgentsController {
         if StatsPage.hasContent(model.summary, visible: model.visibleCards) {
             left = [
                 .init(symbol: "square.grid.2x2", title: L.pageOverview, selected: model.page == .overview) { [weak self] in
-                    self?.model.page = .overview
-                    ViewSettings.page = .overview
-                    self?.render()
+                    self?.show(page: .overview)
                 },
                 .init(symbol: "chart.bar.xaxis", title: L.pageStats, selected: model.page == .stats) { [weak self] in
-                    self?.model.page = .stats
-                    ViewSettings.page = .stats
-                    self?.render()
+                    self?.show(page: .stats)
                 }
             ]
         }
@@ -129,7 +145,8 @@ final class AgentsController {
         let localWork = store.sessions.values.contains {
             $0.host == nil && ($0.status == .working || $0.status == .waitingApproval)
         }
-        let hold = (settings.keepAwake && localWork) || settings.manualAwakeActive
+        let nightWork = nightProcess != nil
+        let hold = (settings.keepAwake && localWork) || settings.manualAwakeActive || nightWork
         keepAwake.update(shouldHold: hold)
         lidGuard.set(hold && settings.keepAwakeLidClosed && LidSleepGuard.onACPower)
     }
@@ -166,6 +183,7 @@ final class AgentsController {
 
     private func handle(_ event: HookEvent, requestId: String?) {
         if let host = event.host { remoteSeen[host] = Date() }
+        if event.nightShift != nil { nightSessions.insert(AgentStore.key(agent: event.agent, sessionId: event.sessionId)) }
         let effects = store.apply(event, requestId: requestId)
         for effect in effects {
             switch effect {
@@ -182,6 +200,10 @@ final class AgentsController {
                     } else {
                         peek(.finished(title: title, detail: detail), cooldown: Self.finishPeekCooldown)
                     }
+                }
+                if telegram.settings.sendFinished, let session = store.sessions[key] {
+                    telegram.send("✅ " + L.finishedTitle(session.agent) + " · "
+                                  + (duration.map { L.finishedBody(session.projectName, Fmt.countdown($0)) } ?? session.projectName))
                 }
                 if !settings.isQuiet, notifier.settings.notifiesFinish(after: duration), let session = store.sessions[key] {
                     notifier.post(title: L.finishedTitle(session.agent),
@@ -201,6 +223,38 @@ final class AgentsController {
                 if let limit = model.restingLimit, limit.window.percent >= 80 {
                     react(.think)
                 }
+            case .receipt(let receipt):
+                model.receipt = receipt
+                model.receiptTestCommand = nil
+                model.reviewer = nil
+                if receipt.host == nil, let cwd = receipt.cwd, !receipt.files.isEmpty {
+                    DispatchQueue.global(qos: .utility).async { [weak self] in
+                        let found = TestRunner.detect(cwd: cwd)
+                        let reviewer = CrossReview.reviewer(for: receipt.agent)
+                        let canReview = Self.binary(for: reviewer) != nil
+                            && CrossReview.diff(cwd: cwd, files: receipt.files) != nil
+                        DispatchQueue.main.async {
+                            guard let self, self.model.receipt?.id == receipt.id else { return }
+                            self.model.reviewer = canReview ? reviewer : nil
+                            if let found {
+                                self.model.receiptTestCommand = found.command
+                                if self.settings.autoRunTests { self.runTests(for: receipt) }
+                            }
+                            self.render()
+                        }
+                    }
+                }
+                if receipt.host == nil, let cwd = receipt.cwd, !receipt.files.isEmpty {
+                    DispatchQueue.global(qos: .utility).async { [weak self] in
+                        let changes = LineChanges.count(cwd: cwd, files: receipt.files)
+                        DispatchQueue.main.async {
+                            guard let self, let changes, self.model.receipt?.id == receipt.id else { return }
+                            self.model.receipt?.added = changes.added
+                            self.model.receipt?.removed = changes.removed
+                            self.render()
+                        }
+                    }
+                }
             case .snapshotTaken(let key, let snapshot):
                 let notice = SafetyNetNotice(snapshot: snapshot, host: store.sessions[key]?.host)
                 model.safetyNet = notice
@@ -210,6 +264,14 @@ final class AgentsController {
                 }
                 peek(.finished(title: L.safetyPeekTitle, detail: snapshot.command))
             case .needsAttention(let id):
+                // A night-shift session asked anyway: answer with the careful policy.
+                if let approval = store.approvals.first(where: { $0.id == id }), nightSessions.contains(approval.sessionKey) {
+                    answer(id: id, decision: NightShift.decision(for: approval.risk))
+                    continue
+                }
+                if let approval = store.approvals.first(where: { $0.id == id }) {
+                    telegram.sendApproval(id: id, text: L.phoneRequestText(approval))
+                }
                 // Denny reacts to what is being asked: calm, wary or scared.
                 switch store.approvals.first(where: { $0.id == id })?.risk.level ?? .safe {
                 case .safe, .caution:
@@ -227,9 +289,32 @@ final class AgentsController {
         render()
     }
 
+    private static var savedReportsURL: URL { BridgePaths.directory().appendingPathComponent("server-reports.json") }
+
+    /// Servers' last reports from before a restart: the notch shows them (as
+    /// "updated N min ago") until a fresh one comes in.
+    private func restoreServerReports() {
+        guard let data = try? Data(contentsOf: Self.savedReportsURL),
+              let saved = try? JSONDecoder().decode([String: UsageReport].self, from: data) else { return }
+        for (source, report) in saved where reports[source] == nil {
+            reports[source] = report
+            remoteSeen[report.host] = Date(timeIntervalSince1970: report.generatedAt)
+        }
+        model.summary = UsageSummary.combine(Array(reports.values))
+    }
+
+    private func saveServerReports() {
+        let remote = reports.filter { $0.key != "this-mac" }
+        guard let data = try? JSONEncoder().encode(remote) else { return }
+        try? data.write(to: Self.savedReportsURL, options: .atomic)
+    }
+
     private func receive(_ report: UsageReport, from source: String) {
         reports[source] = report
-        if source != "this-mac" { remoteSeen[report.host] = Date() }
+        if source != "this-mac" {
+            remoteSeen[report.host] = Date()
+            saveServerReports()
+        }
         if source == "this-mac" {
             // Only a Mac whose own Codex answered can spend a reset from here.
             model.canResetCodex = !(report.resets ?? []).isEmpty
@@ -243,6 +328,7 @@ final class AgentsController {
     private func answer(id: String, decision: ApprovalDecision) {
         store.resolveApproval(id: id)
         server.answer(id: id, decision: decision)
+        telegram.finish(id: id, text: decision == .allow ? L.phoneAllowed : decision == .deny ? L.phoneDenied : L.phoneExpired)
         switch decision {
         case .allow: react(.joy)
         case .deny: react(.scared)
@@ -258,10 +344,12 @@ final class AgentsController {
         for approval in store.approvals where approval.receivedAt < deadline {
             store.resolveApproval(id: approval.id)
             server.answer(id: approval.id, decision: .ask)
+            telegram.finish(id: approval.id, text: L.phoneExpired)
         }
         store.prune()
         refreshHooksState()
         if settings.quietUntil != nil, !settings.isQuiet { settings.quietUntil = nil }
+        startDueNightJob()
         updateAwake()
         model.summary = UsageSummary.combine(Array(reports.values))
         render()
@@ -460,6 +548,251 @@ final class AgentsController {
         render()
     }
 
+    /// Runs the project's tests in a login shell (so node, cargo and the
+    /// like are on PATH), with CI=1 so watchers exit, for up to ten minutes.
+    private func runTests(for receipt: TaskReceipt) {
+        guard receipt.host == nil, let cwd = receipt.cwd,
+              model.testRun.map({ $0.state != .running }) ?? true else { return }
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let found = TestRunner.detect(cwd: cwd) else { return }
+            let started = Date()
+            DispatchQueue.main.async {
+                self?.model.testRun = TestRun(receiptId: receipt.id, command: found.command, startedAt: started, state: .running)
+                self?.render()
+            }
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: "/bin/zsh")
+            process.arguments = ["-lc", found.command]
+            process.currentDirectoryURL = URL(fileURLWithPath: found.root)
+            process.environment = ProcessInfo.processInfo.environment.merging(["CI": "1"]) { _, new in new }
+            let output = Pipe()
+            process.standardOutput = output
+            process.standardError = output
+            process.standardInput = FileHandle.nullDevice
+            var timedOut = false
+            let timer = DispatchWorkItem {
+                if process.isRunning {
+                    timedOut = true
+                    process.terminate()
+                }
+            }
+            var text = ""
+            let launched = (try? process.run()) != nil
+            if launched {
+                DispatchQueue.global().asyncAfter(deadline: .now() + TestRunner.timeout, execute: timer)
+                text = String(decoding: output.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+                process.waitUntilExit()
+                timer.cancel()
+            }
+            // terminationStatus throws for a process that never started.
+            let passed = launched && !timedOut && process.terminationReason == .exit && process.terminationStatus == 0
+            let tail = TestRunner.tail(text) + (timedOut ? "\n" + L.testsTimedOut : "")
+            DispatchQueue.main.async {
+                guard let self, self.model.testRun?.receiptId == receipt.id else { return }
+                self.model.testRun?.state = passed ? .passed : .failed(output: tail)
+                self.model.testRun?.duration = Date().timeIntervalSince(started)
+                self.react(passed ? .joy : .scared)
+                self.render()
+            }
+        }
+    }
+
+    /// The reviewer's command line tool: the usual places, then the login shell's PATH.
+    private static func binary(for agent: AgentKind) -> String? {
+        let fm = FileManager.default
+        if let path = CrossReview.candidates(agent).first(where: { fm.isExecutableFile(atPath: $0) }) { return path }
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/zsh")
+        process.arguments = ["-lc", "command -v " + (agent == .claude ? "claude" : "codex")]
+        let output = Pipe()
+        process.standardOutput = output
+        process.standardError = FileHandle.nullDevice
+        guard (try? process.run()) != nil else { return nil }
+        let path = String(decoding: output.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        process.waitUntilExit()
+        return process.terminationStatus == 0 && path.hasPrefix("/") ? path : nil
+    }
+
+    /// The other agent reads the task's diff and lists problems, read-only,
+    /// in a login shell so a node-based CLI finds node.
+    private func runReview(of receipt: TaskReceipt) {
+        guard receipt.host == nil, let cwd = receipt.cwd,
+              model.review.map({ $0.state != .running }) ?? true else { return }
+        let reviewer = CrossReview.reviewer(for: receipt.agent)
+        let started = Date()
+        model.review = ReviewRun(receiptId: receipt.id, author: receipt.agent, reviewer: reviewer, startedAt: started, state: .running)
+        react(.think)
+        render()
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let state: ReviewRun.State
+            if let binary = Self.binary(for: reviewer) {
+                if let diff = CrossReview.diff(cwd: cwd, files: receipt.files) {
+                    let root = CrossReview.projectRoot(cwd: cwd)
+                    let prompt = CrossReview.prompt(author: receipt.agent, task: receipt.prompt, diff: diff)
+                    state = Self.review(binary: binary, arguments: CrossReview.arguments(reviewer: reviewer, prompt: prompt), root: root)
+                } else {
+                    state = .failed(L.reviewNoChanges)
+                }
+            } else {
+                state = .failed(L.reviewNotFound)
+            }
+            DispatchQueue.main.async {
+                guard let self, self.model.review?.receiptId == receipt.id else { return }
+                self.model.review?.state = state
+                if case .done(_, let findings) = state { self.react(findings == 0 ? .joy : .idea) }
+                self.render()
+            }
+        }
+    }
+
+    private static func review(binary: String, arguments: [String], root: String) -> ReviewRun.State {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/zsh")
+        process.arguments = ["-lc", "\"$0\" \"$@\"", binary] + arguments
+        process.currentDirectoryURL = URL(fileURLWithPath: root)
+        let output = Pipe()
+        process.standardOutput = output
+        process.standardError = FileHandle.nullDevice
+        process.standardInput = FileHandle.nullDevice
+        guard (try? process.run()) != nil else { return .failed("—") }
+        var timedOut = false
+        let timer = DispatchWorkItem {
+            if process.isRunning {
+                timedOut = true
+                process.terminate()
+            }
+        }
+        DispatchQueue.global().asyncAfter(deadline: .now() + CrossReview.timeout, execute: timer)
+        let text = String(decoding: output.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        process.waitUntilExit()
+        timer.cancel()
+        if timedOut { return .failed(L.testsTimedOut) }
+        guard process.terminationStatus == 0, !text.isEmpty else {
+            return .failed(TestRunner.tail(text, lines: 3).isEmpty ? "exit \(process.terminationStatus)" : TestRunner.tail(text, lines: 3))
+        }
+        return .done(text: text, findings: CrossReview.findings(in: text))
+    }
+
+    private func copyReview() {
+        guard let review = model.review, case .done(let text, _) = review.state else { return }
+        copyToPasteboard(L.reviewAgentMessage(review.reviewer, text))
+        showDropMessage(DropMessage(title: L.reviewCopied(review.author), warning: nil))
+    }
+
+    private func copyTestFailure() {
+        guard let run = model.testRun, case .failed(let output) = run.state else { return }
+        copyToPasteboard(L.testsAgentMessage(run.command, output))
+        showDropMessage(DropMessage(title: L.testsCopied, warning: nil))
+    }
+
+    // MARK: - Night shift
+
+    func addNightJob(_ job: NightJob) {
+        nightJobs.append(job)
+        NightShift.save(nightJobs)
+    }
+
+    /// Cancels a waiting job, stops a running one, or forgets a finished one.
+    func removeNightJob(id: String) {
+        if case .running? = nightJobs.first(where: { $0.id == id })?.state { nightProcess?.terminate() }
+        nightJobs.removeAll { $0.id == id }
+        NightShift.save(nightJobs)
+    }
+
+    /// Where the newest local session works: the default folder for a new job.
+    var recentLocalFolder: String? {
+        store.orderedSessions.first { $0.host == nil && $0.cwd != nil }?.cwd
+    }
+
+    func renewTrigger(for agent: AgentKind) -> NightJob.Trigger {
+        NightShift.renewTrigger(model.summary.limits[agent])
+    }
+
+    private func startDueNightJob() {
+        guard nightProcess == nil,
+              let index = nightJobs.firstIndex(where: { NightShift.isDue($0, limits: model.summary.limits[$0.agent]) }) else { return }
+        let job = nightJobs[index]
+        guard let binary = Self.binary(for: job.agent), FileManager.default.fileExists(atPath: job.folder) else {
+            finishNightJob(id: job.id, state: .failed(at: Date(), reason: L.reviewNotFound))
+            return
+        }
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/zsh")
+        process.arguments = ["-lc", "\"$0\" \"$@\"", binary] + NightShift.arguments(job)
+        process.currentDirectoryURL = URL(fileURLWithPath: job.folder)
+        process.environment = ProcessInfo.processInfo.environment.merging([NightShift.environmentKey: job.id]) { _, new in new }
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = FileHandle.nullDevice
+        process.standardInput = FileHandle.nullDevice
+        process.terminationHandler = { [weak self] finished in
+            DispatchQueue.main.async {
+                let ok = finished.terminationReason == .exit && finished.terminationStatus == 0
+                self?.finishNightJob(id: job.id, state: ok ? .done(at: Date())
+                                     : .failed(at: Date(), reason: "exit \(finished.terminationStatus)"))
+            }
+        }
+        guard (try? process.run()) != nil else {
+            finishNightJob(id: job.id, state: .failed(at: Date(), reason: "—"))
+            return
+        }
+        nightProcess = process
+        nightJobs[index].state = .running(since: Date())
+        NightShift.save(nightJobs)
+        telegram.send("🌙 " + L.nightStarted(job.agent, (job.folder as NSString).lastPathComponent))
+        // A runaway job is stopped after a few hours.
+        DispatchQueue.main.asyncAfter(deadline: .now() + NightShift.timeout) { [weak process] in
+            if process?.isRunning == true { process?.terminate() }
+        }
+        updateAwake()
+    }
+
+    private func finishNightJob(id: String, state: NightJob.State) {
+        nightProcess = nil
+        guard let index = nightJobs.firstIndex(where: { $0.id == id }) else { return }
+        nightJobs[index].state = state
+        NightShift.save(nightJobs)
+        let job = nightJobs[index]
+        let place = (job.folder as NSString).lastPathComponent
+        if case .failed(_, let reason) = state {
+            telegram.send("🌙 " + L.nightFailed(job.agent, place, reason))
+        } else {
+            telegram.send("🌙 " + L.nightDone(job.agent, place))
+        }
+        updateAwake()
+        render()
+    }
+
+    private func show(page: NotchPage) {
+        guard page != model.page else { return }
+        model.page = page
+        ViewSettings.page = page
+        render()
+    }
+
+    /// Two fingers sideways on the open notch flip between Overview and
+    /// Stats; vertical scrolling of a long notch is left alone.
+    private func handleSwipe(_ event: NSEvent) -> NSEvent? {
+        guard model.mode == .expanded, event.window === panel, event.hasPreciseScrollingDeltas,
+              event.momentumPhase.isEmpty,
+              StatsPage.hasContent(model.summary, visible: model.visibleCards) else { return event }
+        if event.phase == .began {
+            swipe = .zero
+            swipeDone = false
+        }
+        swipe.dx += event.scrollingDeltaX
+        swipe.dy += event.scrollingDeltaY
+        let sideways = abs(swipe.dx) > abs(swipe.dy) * 1.5
+        if !swipeDone, sideways, abs(swipe.dx) > 40 {
+            swipeDone = true
+            // Where the fingers went, whatever the natural scrolling setting.
+            let fingersLeft = (event.isDirectionInvertedFromDevice ? swipe.dx : -swipe.dx) < 0
+            show(page: fingersLeft ? .stats : .overview)
+        }
+        return sideways ? nil : event
+    }
+
     func toggleQuiet() {
         settings.quietUntil = settings.isQuiet ? nil : Date().addingTimeInterval(3600)
         render()
@@ -558,6 +891,22 @@ final class AgentsController {
                     self?.render()
                 },
                 undoSnapshot: { [weak self] notice in self?.undo(notice) },
+                copyReceipt: { [weak self] receipt in
+                    self?.copyToPasteboard(ReceiptCard.text(receipt))
+                    self?.showDropMessage(DropMessage(title: L.receiptCopied, warning: nil))
+                },
+                dismissReceipt: { [weak self] in
+                    self?.model.receipt = nil
+                    self?.render()
+                },
+                runTests: { [weak self] receipt in self?.runTests(for: receipt) },
+                sendTestFailure: { [weak self] in self?.copyTestFailure() },
+                runReview: { [weak self] receipt in self?.runReview(of: receipt) },
+                sendReview: { [weak self] in self?.copyReview() },
+                dismissReview: { [weak self] in
+                    self?.model.review = nil
+                    self?.render()
+                },
                 dismissSnapshot: { [weak self] in
                     self?.model.safetyNet = nil
                     self?.render()

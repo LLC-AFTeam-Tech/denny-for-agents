@@ -11,6 +11,13 @@ struct NotchActions {
     var relay: (String, Bool) -> Void = { _, _ in }
     var dismissRelay: () -> Void = {}
     var undoSnapshot: (SafetyNetNotice) -> Void = { _ in }
+    var copyReceipt: (TaskReceipt) -> Void = { _ in }
+    var dismissReceipt: () -> Void = {}
+    var runTests: (TaskReceipt) -> Void = { _ in }
+    var sendTestFailure: () -> Void = {}
+    var runReview: (TaskReceipt) -> Void = { _ in }
+    var sendReview: () -> Void = {}
+    var dismissReview: () -> Void = {}
     var dismissSnapshot: () -> Void = {}
 }
 
@@ -186,6 +193,17 @@ struct ExpandedContent: View {
                 RelayCard(offer: offer, now: model.now,
                           onCopy: { actions.relay(offer.sessionKey, true) }, onLater: actions.dismissRelay)
             }
+            if let receipt = model.receipt, model.now.timeIntervalSince(receipt.finishedAt) < 3600 {
+                ReceiptCard(receipt: receipt, testCommand: model.receiptTestCommand,
+                            test: model.testRun?.receiptId == receipt.id ? model.testRun : nil, now: model.now,
+                            onCopy: { actions.copyReceipt(receipt) }, onHide: actions.dismissReceipt,
+                            onRunTests: { actions.runTests(receipt) }, onSendFailure: actions.sendTestFailure,
+                            reviewer: model.review?.receiptId == receipt.id ? nil : model.reviewer,
+                            onReview: { actions.runReview(receipt) })
+                if let review = model.review, review.receiptId == receipt.id {
+                    ReviewCard(review: review, now: model.now, onSend: actions.sendReview, onHide: actions.dismissReview)
+                }
+            }
             if let notice = model.safetyNet, model.now.timeIntervalSince1970 - notice.snapshot.createdAt < 3600 {
                 SafetyNetCard(notice: notice, onUndo: { actions.undoSnapshot(notice) }, onHide: actions.dismissSnapshot)
             }
@@ -315,6 +333,150 @@ struct RelayCard: View {
         }
         .padding(12)
         .background(RoundedRectangle(cornerRadius: 14).stroke(offer.to.tint.opacity(0.7), lineWidth: 1))
+    }
+}
+
+/// What the last task changed and cost — made to be screenshotted.
+struct ReceiptCard: View {
+    let receipt: TaskReceipt
+    var testCommand: String?
+    var test: TestRun?
+    var now = Date()
+    let onCopy: () -> Void
+    let onHide: () -> Void
+    var onRunTests: () -> Void = {}
+    var onSendFailure: () -> Void = {}
+    var reviewer: AgentKind?
+    var onReview: () -> Void = {}
+
+    static func lines(_ receipt: TaskReceipt) -> [String] {
+        var files = L.receiptFiles(receipt.files.count)
+        if let added = receipt.added, let removed = receipt.removed { files += " (" + L.receiptLines(added, removed) + ")" }
+        var result = [files, L.receiptCommands(receipt.commands)]
+        if receipt.tokens > 0 {
+            var tokens = L.receiptTokens(Fmt.tokens(receipt.tokens))
+            if let cost = receipt.cost { tokens += " · " + L.receiptCost(Fmt.cost(cost)) }
+            result.append(tokens)
+        }
+        return result
+    }
+
+    /// One line for the clipboard.
+    static func text(_ receipt: TaskReceipt) -> String {
+        var parts = ["🧾 " + receipt.agent.displayName, receipt.projectName]
+        if let duration = receipt.duration { parts.append(Fmt.countdown(duration)) }
+        return (parts + lines(receipt)).joined(separator: " · ") + " — " + L.receiptSignature
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 8) {
+                AgentMark(agent: receipt.agent, size: 14)
+                Text(L.receiptTitle).font(.system(size: 12, weight: .semibold))
+                Text(receipt.projectName).font(.system(size: 12)).foregroundColor(.white.opacity(0.6)).lineLimit(1)
+                Spacer()
+                if let duration = receipt.duration {
+                    Label(Fmt.countdown(duration), systemImage: "timer")
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundColor(.white.opacity(0.7))
+                }
+            }
+            ForEach(Self.lines(receipt), id: \.self) { line in
+                Text(line).font(.system(size: 11, design: .rounded)).foregroundColor(.white.opacity(0.85))
+            }
+            if !receipt.files.isEmpty {
+                Text(receipt.files.prefix(4).map { ($0 as NSString).lastPathComponent }.joined(separator: ", ")
+                     + (receipt.files.count > 4 ? " …" : ""))
+                    .font(.system(size: 10, design: .monospaced))
+                    .foregroundColor(.white.opacity(0.5))
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+            }
+            if let test {
+                testLine(test)
+            }
+            HStack(spacing: 8) {
+                if let test, case .failed = test.state {
+                    NotchButton(title: L.testsSendToAgent, color: .red, prominent: true, action: onSendFailure)
+                } else if test == nil, testCommand != nil {
+                    NotchButton(title: L.testsRun, color: .green, action: onRunTests)
+                        .help(testCommand ?? "")
+                }
+                if let reviewer {
+                    NotchButton(title: L.reviewButton(reviewer), color: reviewer.tint, action: onReview)
+                }
+            }
+            HStack(spacing: 8) {
+                NotchButton(title: L.receiptCopy, color: receipt.agent.tint, prominent: true, action: onCopy)
+                NotchButton(title: L.receiptHide, color: .gray, action: onHide)
+            }
+        }
+        .padding(12)
+        .background(RoundedRectangle(cornerRadius: 14).stroke(receipt.agent.tint.opacity(0.6), style: StrokeStyle(lineWidth: 1, dash: [4, 3])))
+    }
+
+    @ViewBuilder private func testLine(_ test: TestRun) -> some View {
+        let duration = Fmt.countdown(test.duration ?? now.timeIntervalSince(test.startedAt))
+        switch test.state {
+        case .running:
+            HStack(spacing: 6) {
+                ProgressView().controlSize(.mini)
+                Text(L.testsRunning(test.command)).lineLimit(1)
+            }
+            .font(.system(size: 11, weight: .medium))
+            .foregroundColor(.white.opacity(0.8))
+        case .passed:
+            Text(L.testsPassed(duration)).font(.system(size: 11, weight: .semibold)).foregroundColor(.green)
+        case .failed:
+            Text(L.testsFailed(duration)).font(.system(size: 11, weight: .semibold)).foregroundColor(.red)
+        }
+    }
+}
+
+/// The other agent's read-only review of the task's changes.
+struct ReviewCard: View {
+    let review: ReviewRun
+    let now: Date
+    let onSend: () -> Void
+    let onHide: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 8) {
+                AgentMark(agent: review.reviewer, size: 14)
+                switch review.state {
+                case .running:
+                    ProgressView().controlSize(.mini)
+                    Text(L.reviewRunning(review.reviewer, Fmt.countdown(now.timeIntervalSince(review.startedAt))))
+                case .done(_, let findings):
+                    Text(findings == 0 ? L.reviewClean(review.reviewer) : L.reviewFindings(review.reviewer, findings))
+                case .failed(let reason):
+                    Text(L.reviewFailed(review.reviewer, reason)).foregroundColor(.orange)
+                }
+                Spacer()
+            }
+            .font(.system(size: 12, weight: .semibold))
+            if case .done(let text, _) = review.state {
+                ScrollView {
+                    Text(text)
+                        .font(.system(size: 11))
+                        .foregroundColor(.white.opacity(0.85))
+                        .textSelection(.enabled)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .frame(maxHeight: 150)
+            }
+            HStack(spacing: 8) {
+                if case .done(_, let findings) = review.state, findings > 0 {
+                    NotchButton(title: L.reviewSend(review.author), color: review.author.tint, prominent: true, action: onSend)
+                }
+                if review.state != .running {
+                    NotchButton(title: L.receiptHide, color: .gray, action: onHide)
+                }
+            }
+        }
+        .padding(12)
+        .background(RoundedRectangle(cornerRadius: 14).stroke(review.reviewer.tint.opacity(0.6), lineWidth: 1))
     }
 }
 

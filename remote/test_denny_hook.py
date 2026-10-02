@@ -214,6 +214,26 @@ class HookTests(unittest.TestCase):
         hook.uninstall()
         self.assertEqual(json.load(open(path))["statusLine"], mine)
 
+    def test_mac_gets_only_the_status_line(self):
+        path = hook.CONFIG_FILES["claude"]
+        os.makedirs(os.path.dirname(path))
+        hooks = {"PreToolUse": [{"hooks": [{"type": "command", "command": "/x/bin/denny-hook claude"}]}]}
+        mine = {"type": "command", "command": "echo my-line"}
+        with open(path, "w") as handle:
+            json.dump({"hooks": hooks, "statusLine": mine, "model": "opus"}, handle)
+        self.assertEqual(hook.main(["denny-hook.py", "--statusline-install"]), 0)
+        config = json.load(open(path))
+        self.assertIn("--statusline", config["statusLine"]["command"])
+        self.assertEqual(config["hooks"], hooks)
+        self.assertEqual(config["model"], "opus")
+        self.assertFalse(os.path.exists(hook.CONFIG_PATH))
+        self.assertTrue(os.path.exists(hook.INSTALLED_SCRIPT))
+        hook.main(["denny-hook.py", "--statusline-install"])
+        self.assertEqual(json.load(open(hook.STATUSLINE_ORIGINAL))["command"], "echo my-line")
+        self.assertEqual(hook.main(["denny-hook.py", "--statusline-uninstall"]), 0)
+        self.assertEqual(json.load(open(path))["statusLine"], mine)
+        self.assertEqual(json.load(open(path))["hooks"], hooks)
+
     def test_install_refuses_unreadable_config(self):
         path = hook.CONFIG_FILES["claude"]
         os.makedirs(os.path.dirname(path))
@@ -581,6 +601,33 @@ class SafetyNetTests(unittest.TestCase):
         snapshot = denny.requests[0]["event"]["snapshot"]
         self.assertEqual(snapshot["command"], "git reset --hard")
         self.assertEqual(snapshot["repo"], self.repo)
+
+
+class TurnUsageTests(unittest.TestCase):
+    def test_counts_only_the_last_task(self):
+        path = os.path.join(tempfile.mkdtemp(), "t.jsonl")
+        def assistant(request, output, model="claude-opus-5-5", read=0):
+            return {"type": "assistant", "requestId": request,
+                    "message": {"model": model, "usage": {"input_tokens": 1, "output_tokens": output,
+                                                          "cache_read_input_tokens": read}}}
+        jsonl(path, [
+            {"type": "user", "message": {"role": "user", "content": "old task"}},
+            assistant("r0", 999),
+            {"type": "user", "message": {"role": "user", "content": [{"type": "text", "text": "new task"}]}},
+            assistant("r1", 10, read=100),
+            assistant("r1", 30, read=100),
+            {"type": "user", "message": {"role": "user", "content": [{"type": "tool_result", "content": "ok"}]}},
+            {"type": "user", "isMeta": True, "message": {"role": "user", "content": "<meta>"}},
+            assistant("r2", 5),
+            assistant("r3", 7, model="claude-sonnet-5-5"),
+        ])
+        usage = hook.turn_usage(path)
+        self.assertEqual([item["model"] for item in usage], ["claude-opus-5-5", "claude-sonnet-5-5"])
+        self.assertEqual(usage[0]["output"], 35)
+        self.assertEqual(usage[0]["cacheRead"], 100)
+        self.assertEqual(usage[0]["input"], 2)
+        self.assertEqual(usage[1]["output"], 7)
+        self.assertEqual(hook.turn_usage(os.path.join(tempfile.mkdtemp(), "missing.jsonl")), [])
 
 
 if __name__ == "__main__":

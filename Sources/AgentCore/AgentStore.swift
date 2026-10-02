@@ -33,6 +33,9 @@ public struct AgentSession: Equatable, Identifiable, Sendable {
     public var history: [StepRecord] = []
     /// Stuck warnings already given this turn.
     public var stuckWarned: Set<String> = []
+    /// Files edited and commands run in the current task, for its receipt.
+    public var turnFiles: [String] = []
+    public var turnCommands = 0
     public static let maxHistory = 80
 
     public static let maxTouched = 20
@@ -91,6 +94,8 @@ public enum AgentStoreEffect: Equatable, Sendable {
     case needsAttention(approvalId: String)
     /// The hook saved the files right before a destructive command.
     case snapshotTaken(sessionKey: String, snapshot: SafetySnapshot)
+    /// A task ended: what it changed and cost.
+    case receipt(TaskReceipt)
 }
 
 public enum AgentMood: Equatable, Sendable {
@@ -185,6 +190,8 @@ public struct AgentStore: Equatable, Sendable {
             }
             session.history = []
             session.stuckWarned = []
+            session.turnFiles = []
+            session.turnCommands = 0
             effects.append(.turnStarted(sessionKey: key))
         case .preToolUse:
             let step = StepDescriber.describe(toolName: event.toolName, toolInput: event.toolInput, language: language)
@@ -196,6 +203,18 @@ public struct AgentStore: Equatable, Sendable {
             session.stepKind = kind
             if let snapshot = event.snapshot { effects.append(.snapshotTaken(sessionKey: key, snapshot: snapshot)) }
             session.remember(toolName: event.toolName, input: event.toolInput ?? [:])
+            switch kind {
+            case .writing:
+                let input = event.toolInput ?? [:]
+                if let path = input["file_path"]?.stringValue ?? input["path"]?.stringValue ?? input["notebook_path"]?.stringValue
+                    ?? StepDescriber.patchedPath(input), !session.turnFiles.contains(path) {
+                    session.turnFiles.append(path)
+                }
+            case .running:
+                session.turnCommands += 1
+            default:
+                break
+            }
             session.history.append(StepRecord(at: now, kind: kind, target: StuckDetector.target(toolName: event.toolName,
                                                                                                input: event.toolInput ?? [:])))
             if session.history.count > AgentSession.maxHistory {
@@ -246,7 +265,16 @@ public struct AgentStore: Equatable, Sendable {
             session.turnStartedAt = nil
             session.stepKind = nil
             session.lastMessage = event.lastAssistantMessage
-            if event.name == .stop { effects.append(.celebrate(sessionKey: key, duration: duration)) }
+            if event.name == .stop {
+                effects.append(.celebrate(sessionKey: key, duration: duration))
+                let usage = event.turnUsage ?? []
+                if !session.turnFiles.isEmpty || session.turnCommands > 0 || !usage.isEmpty {
+                    effects.append(.receipt(TaskReceipt(
+                        sessionKey: key, agent: session.agent, projectName: session.projectName, cwd: session.cwd,
+                        host: session.host, duration: duration, finishedAt: now, files: session.turnFiles,
+                        commands: session.turnCommands, usage: usage, prompt: session.lastPrompt)))
+                }
+            }
         case .sessionEnd, .other:
             break
         }

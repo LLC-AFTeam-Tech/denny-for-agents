@@ -3,7 +3,7 @@ import AppKit
 import SwiftUI
 
 enum SettingsSection: String, CaseIterable, Identifiable {
-    case agents, servers, load, safetyNet, notch, cards, alerts, language, privacy, about
+    case agents, servers, load, safetyNet, phone, nightShift, notch, cards, alerts, language, privacy, about
 
     var id: String { rawValue }
 
@@ -13,6 +13,8 @@ enum SettingsSection: String, CaseIterable, Identifiable {
         case .servers: return "server.rack"
         case .load: return "speedometer"
         case .safetyNet: return "lifepreserver"
+        case .phone: return "iphone"
+        case .nightShift: return "moon.stars"
         case .notch: return "rectangle.topthird.inset.filled"
         case .cards: return "square.grid.2x2"
         case .alerts: return "bell"
@@ -52,6 +54,11 @@ final class SettingsModel: ObservableObject {
     var safetySnapshots: () -> [SafetyNetNotice] = { [] }
     var undoSnapshot: (SafetyNetNotice) -> Void = { _ in }
     var clearSnapshots: () -> Void = {}
+    var nightJobs: () -> [NightJob] = { [] }
+    var addNightJob: (NightJob) -> Void = { _ in }
+    var removeNightJob: (String) -> Void = { _ in }
+    var recentFolder: () -> String? = { nil }
+    var renewTrigger: (AgentKind) -> NightJob.Trigger = { _ in .limitRenews(resetsAt: nil) }
     /// Read by the hooks from ~/.denny-for-agents/safety-net/settings.json.
     @Published var safetySettings = SafetyNetSettings.load() {
         didSet { safetySettings.save() }
@@ -135,6 +142,13 @@ final class SettingsModel: ObservableObject {
 struct SettingsView: View {
     @ObservedObject var model: SettingsModel
     @ObservedObject var settings = AppSettings.shared
+    @ObservedObject var telegram = TelegramBridge.shared
+    @State private var botToken = ""
+    @State private var nightAgent: AgentKind = .claude
+    @State private var nightFolder = ""
+    @State private var nightPrompt = ""
+    @State private var nightAtTime = false
+    @State private var nightTime = Calendar.current.date(bySettingHour: 3, minute: 0, second: 0, of: Date()) ?? Date()
     @State private var hoveredSection: SettingsSection?
 
     /// Called by the footer buttons.
@@ -161,7 +175,7 @@ struct SettingsView: View {
                     } label: {
                         Image(systemName: section.symbol)
                             .font(.system(size: 12, weight: .semibold))
-                            .frame(width: 34, height: 28)
+                            .frame(width: 30, height: 28)
                             .foregroundColor(model.section == section ? .black : .white.opacity(0.75))
                             .background(Capsule().fill(model.section == section ? Color(red: 0.55, green: 0.9, blue: 0.55) : .clear))
                     }
@@ -190,6 +204,8 @@ struct SettingsView: View {
                     case .servers: servers
                     case .load: load
                     case .safetyNet: safetyNet
+                    case .phone: phone
+                    case .nightShift: nightShift
                     case .notch: notch
                     case .cards: cards
                     case .alerts: alerts
@@ -434,6 +450,10 @@ struct SettingsView: View {
         PanelCard {
             Toggle(L.stuckSetting, isOn: $settings.stuckAlerts)
         }
+        PanelCard {
+            Toggle(L.testsAutoSetting, isOn: $settings.autoRunTests)
+            Text(L.testsAutoFooter).font(.caption).foregroundColor(.secondary)
+        }
         PanelCard(L.alertLimit) {
             Picker(L.alertLimit, selection: $model.alerts.limitPercent) {
                 Text(L.off).tag(Int?.none)
@@ -539,6 +559,140 @@ struct SettingsView: View {
             Button(L.safetyClear) { model.clearSnapshots() }
         }
         Text(L.safetyLimitFooter).font(.caption).foregroundColor(.secondary)
+    }
+
+    @ViewBuilder private var phone: some View {
+        PanelCard(L.phoneTitle) {
+            if let chat = telegram.settings.chatId, let bot = telegram.settings.botName {
+                Text(L.phoneConnected(telegram.settings.chatName ?? String(chat), bot)).font(.callout)
+                Picker(L.phoneTitle, selection: Binding(get: { telegram.settings.alwaysSend },
+                                                        set: { telegram.setAlwaysSend($0) })) {
+                    Text(L.phoneWhenAway).tag(false)
+                    Text(L.phoneAlways).tag(true)
+                }
+                .labelsHidden()
+                Toggle(L.phoneFinished, isOn: Binding(get: { telegram.settings.sendFinished },
+                                                      set: { telegram.setSendFinished($0) }))
+                HStack {
+                    Button(L.phoneTest) { telegram.send(L.phoneTestText, force: true) }
+                    Button(L.phoneDisconnect) { telegram.disconnect() }
+                }
+            } else if let bot = telegram.settings.botName, let code = telegram.pairingCode {
+                Text(L.phoneSendCode(bot)).font(.callout)
+                Text(L.phoneTopicHint).font(.caption).foregroundColor(.secondary)
+                Text(code).font(.system(size: 28, weight: .bold, design: .monospaced)).textSelection(.enabled)
+                HStack {
+                    if let link = telegram.botLink {
+                        Button(L.phoneOpenBot) { NSWorkspace.shared.open(link) }
+                    }
+                    ProgressView().controlSize(.small)
+                    Text(L.phoneWaiting).font(.caption).foregroundColor(.secondary)
+                }
+                Button(L.phoneDisconnect) { telegram.disconnect() }
+            } else {
+                Text(L.phoneSteps).font(.callout)
+                SecureField(L.phoneTokenPlaceholder, text: $botToken)
+                Button(L.phoneCheck) { telegram.connect(token: botToken) }
+                    .disabled(botToken.trimmingCharacters(in: .whitespaces).isEmpty)
+                if let error = telegram.error {
+                    Text(error).font(.caption).foregroundColor(.orange)
+                }
+            }
+        }
+        Text(L.phoneFooter).font(.caption).foregroundColor(.secondary)
+    }
+
+    @ViewBuilder private var nightShift: some View {
+        PanelCard(L.nightNewJob) {
+            Picker(L.nightAgent, selection: $nightAgent) {
+                ForEach(AgentKind.allCases, id: \.self) { agent in Text(agent.displayName).tag(agent) }
+            }
+            HStack {
+                Text(nightFolder.isEmpty ? L.nightNoFolder : (nightFolder as NSString).abbreviatingWithTildeInPath)
+                    .font(.system(size: 11, design: .monospaced))
+                    .lineLimit(1)
+                    .truncationMode(.head)
+                Spacer()
+                Button(L.nightChooseFolder) { chooseNightFolder() }
+            }
+            TextEditor(text: $nightPrompt)
+                .font(.system(size: 12))
+                .frame(height: 70)
+                .overlay(RoundedRectangle(cornerRadius: 6).stroke(Color.white.opacity(0.15)))
+            Picker(L.nightWhen, selection: $nightAtTime) {
+                Text(L.nightWhenRenews).tag(false)
+                Text(L.nightWhenAt).tag(true)
+            }
+            if nightAtTime {
+                DatePicker(L.nightWhenAt, selection: $nightTime, displayedComponents: .hourAndMinute)
+                    .labelsHidden()
+            }
+            Button(L.nightQueue) { queueNightJob() }
+                .disabled(nightFolder.isEmpty || nightPrompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+        }
+        .onAppear { if nightFolder.isEmpty { nightFolder = model.recentFolder() ?? "" } }
+        let jobs = model.nightJobs()
+        if !jobs.isEmpty {
+            PanelCard(L.nightQueueTitle) {
+                ForEach(jobs.reversed()) { job in
+                    HStack(alignment: .top, spacing: 8) {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(job.prompt).font(.system(size: 12)).lineLimit(2)
+                            Text("\(job.agent.shortName) · \((job.folder as NSString).lastPathComponent) · \(nightStatus(job))")
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                        }
+                        Spacer()
+                        Button {
+                            model.removeNightJob(job.id)
+                            model.objectWillChange.send()
+                        } label: { Image(systemName: "xmark.circle.fill") }
+                        .buttonStyle(.plain)
+                        .foregroundColor(.secondary)
+                    }
+                }
+            }
+        }
+        Text(L.nightFooter).font(.caption).foregroundColor(.secondary)
+    }
+
+    private func nightStatus(_ job: NightJob) -> String {
+        switch job.state {
+        case .waiting:
+            switch job.trigger {
+            case .at(let date): return L.nightWaitsUntil(Fmt.time(date))
+            case .limitRenews(let resetsAt):
+                return resetsAt.map { L.nightWaitsUntil(Fmt.time(Date(timeIntervalSince1970: $0))) } ?? L.nightWaitsForLimit
+            }
+        case .running(let since): return L.nightRunning(Fmt.countdown(Date().timeIntervalSince(since)))
+        case .done(let at): return L.nightDoneAt(Fmt.time(at))
+        case .failed(_, let reason): return L.nightFailedShort(reason)
+        }
+    }
+
+    private func chooseNightFolder() {
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.allowsMultipleSelection = false
+        if !nightFolder.isEmpty { panel.directoryURL = URL(fileURLWithPath: nightFolder) }
+        NSApp.activate(ignoringOtherApps: true)
+        if panel.runModal() == .OK, let url = panel.url { nightFolder = url.path }
+    }
+
+    private func queueNightJob() {
+        var trigger = model.renewTrigger(nightAgent)
+        if nightAtTime {
+            // The next time this clock time comes round.
+            var date = Calendar.current.nextDate(after: Date(), matching: Calendar.current.dateComponents([.hour, .minute], from: nightTime),
+                                                 matchingPolicy: .nextTime) ?? nightTime
+            if date < Date() { date = date.addingTimeInterval(86400) }
+            trigger = .at(date)
+        }
+        model.addNightJob(NightJob(agent: nightAgent, folder: nightFolder,
+                                   prompt: nightPrompt.trimmingCharacters(in: .whitespacesAndNewlines), trigger: trigger))
+        nightPrompt = ""
+        model.objectWillChange.send()
     }
 
     @ViewBuilder private var about: some View {

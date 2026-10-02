@@ -43,6 +43,20 @@ enum HookSetup {
         } else {
             try HookInstaller.uninstall(agent: agent)
         }
+        if agent == .claude { setStatusLine(enabled) }
+    }
+
+    /// Claude Code passes its live plan limits to the status line after every
+    /// reply; the bundled script records them (and keeps the user's own line).
+    static func setStatusLine(_ enabled: Bool) {
+        guard let python = UsageCollector.python, let script = UsageCollector.script else { return }
+        let process = Process()
+        process.executableURL = python
+        process.arguments = [script.path, enabled ? "--statusline-install" : "--statusline-uninstall"]
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = FileHandle.nullDevice
+        guard (try? process.run()) != nil else { return }
+        process.waitUntilExit()
     }
 
     static var anyInstalled: Bool {
@@ -52,5 +66,6 @@ enum HookSetup {
     /// After an app update the copied hook may be outdated.
     static func refreshBinaryIfNeeded() {
         if anyInstalled { _ = try? installBinary() }
+        if HookInstaller.isInstalled(agent: .claude) { setStatusLine(true) }
     }
 }

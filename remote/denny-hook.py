@@ -12,6 +12,7 @@ hook exits 0 with no output and the agent carries on as if it weren't there.
   python3 denny-hook.py --report        # usage + plan limits as JSON (used by the Mac app)
   python3 denny-hook.py --codex-reset   # spend one Codex rate-limit reset credit
   python3 denny-hook.py --statusline    # Claude Code status line: records live plan limits
+  python3 denny-hook.py --statusline-install | --statusline-uninstall   # only the status line (Denny on a Mac)
   python3 denny-hook.py --snapshots     # safety net: snapshots taken before risky commands
   python3 denny-hook.py --restore ID    # put the files of a snapshot back
   python3 denny-hook.py --clear-snapshots
@@ -281,6 +282,13 @@ def run_hook(agent):
                 event["snapshot"] = snapshot
         except Exception:
             pass
+    if event["name"] == "Stop" and agent == "claude":
+        try:
+            usage = turn_usage(payload.get("transcript_path"))
+            if usage:
+                event["turnUsage"] = usage
+        except Exception:
+            pass
     wants_decision = event["name"] == "PermissionRequest"
     decision = send_request(event, config[0], config[1], wants_decision)
     if wants_decision:
@@ -290,6 +298,83 @@ def run_hook(agent):
     elif event["name"] == "Stop":
         sys.stdout.flush()
         send_report_in_background(config[0], config[1])
+
+
+# ---------------------------------------------------------------- task receipt
+
+TURN_TAIL_BYTES = 8 << 20
+
+
+def is_prompt(entry):
+    """A line the user typed (not a tool result or a meta line)."""
+    if entry.get("type") != "user" or entry.get("isMeta"):
+        return False
+    message = entry.get("message")
+    content = message.get("content") if isinstance(message, dict) else None
+    if isinstance(content, str):
+        return bool(content)
+    if isinstance(content, list):
+        return any(isinstance(part, dict) and part.get("type") == "text" for part in content)
+    return False
+
+
+def turn_usage(path):
+    """Tokens of the last task in a Claude Code transcript, by model, in the
+    shape of AgentCore's UsageReport.Item. Mirrors TurnUsage.claude."""
+    if not isinstance(path, str):
+        return []
+    try:
+        with open(path, "rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            size = handle.tell()
+            start = max(0, size - TURN_TAIL_BYTES)
+            handle.seek(start)
+            lines = handle.read().split(b"\n")
+    except OSError:
+        return []
+    if start > 0 and lines:
+        lines = lines[1:]
+    readings, order = {}, []
+    for line in lines:
+        try:
+            entry = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(entry, dict):
+            continue
+        if is_prompt(entry):
+            readings, order = {}, []
+            continue
+        message = entry.get("message")
+        if entry.get("type") != "assistant" or not isinstance(message, dict):
+            continue
+        usage, model = message.get("usage"), message.get("model")
+        if not isinstance(usage, dict) or not isinstance(model, str) or not model or model.startswith("<"):
+            continue
+        split = usage.get("cache_creation") if isinstance(usage.get("cache_creation"), dict) else {}
+        write_total = as_int(usage.get("cache_creation_input_tokens"))
+        write_1h = as_int(split.get("ephemeral_1h_input_tokens"))
+        write_5m = as_int(split.get("ephemeral_5m_input_tokens"))
+        if write_1h + write_5m < write_total:
+            write_5m = write_total - write_1h
+        values = [as_int(usage.get("input_tokens")), write_5m, write_1h,
+                  as_int(usage.get("cache_read_input_tokens")), as_int(usage.get("output_tokens"))]
+        key = entry.get("requestId") or message.get("id") or str(uuid.uuid4())
+        if key in readings:
+            readings[key] = (model, [max(a, b) for a, b in zip(readings[key][1], values)])
+        else:
+            readings[key] = (model, values)
+            order.append(key)
+    by_model, models = {}, []
+    for key in order:
+        model, values = readings[key]
+        if model not in by_model:
+            models.append(model)
+            by_model[model] = [0, 0, 0, 0, 0]
+        by_model[model] = [a + b for a, b in zip(by_model[model], values)]
+    return [{"hour": 0, "agent": "claude", "model": model, "input": v[0], "cacheWrite5m": v[1],
+             "cacheWrite1h": v[2], "cacheRead": v[3], "output": v[4]}
+            for model, v in ((model, by_model[model]) for model in models)]
 
 
 # ---------------------------------------------------------------- safety net
@@ -1417,6 +1502,27 @@ def install(port, token, agents):
         print("Connected %s (%s)" % (agent, path))
 
 
+def install_statusline():
+    """Denny on a Mac: hooks are its own, only the status line comes from here."""
+    os.makedirs(BASE_DIR, mode=0o700, exist_ok=True)
+    source = os.path.abspath(__file__)
+    if source != INSTALLED_SCRIPT:
+        shutil.copy2(source, INSTALLED_SCRIPT)
+    os.chmod(INSTALLED_SCRIPT, 0o755)
+    path = CONFIG_FILES["claude"]
+    write_json(path, with_statusline(read_json(path)))
+    return 0
+
+
+def uninstall_statusline():
+    path = CONFIG_FILES["claude"]
+    config = read_json(path)
+    status = config.get("statusLine") if isinstance(config.get("statusLine"), dict) else {}
+    if MARKER in str(status.get("command", "")):
+        write_json(path, without_statusline(config))
+    return 0
+
+
 def uninstall():
     for agent, path in CONFIG_FILES.items():
         config = read_json(path)
@@ -1470,6 +1576,10 @@ def main(argv):
         return 0
     if "--ping" in argv:
         return ping()
+    if "--statusline-install" in argv:
+        return install_statusline()
+    if "--statusline-uninstall" in argv:
+        return uninstall_statusline()
     if "--statusline" in argv:
         try:
             raw = sys.stdin.buffer.read()
