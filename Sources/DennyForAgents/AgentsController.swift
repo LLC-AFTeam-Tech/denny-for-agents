@@ -176,8 +176,9 @@ final class AgentsController {
                     let detail = duration.map { L.finishedBody(session.projectName, Fmt.countdown($0)) } ?? session.projectName
                     let title = L.finishedTitle(session.agent)
                     if DennyClipView.url(DennyClipView.finishFile(session.agent)) != nil {
+                        // A quick answer can finish while the start-of-task peek is still up.
                         peek(.celebration(agent: session.agent, title: title, detail: detail),
-                             cooldown: Self.finishPeekCooldown, duration: Self.celebrationDuration)
+                             cooldown: 0, duration: Self.celebrationDuration)
                     } else {
                         peek(.finished(title: title, detail: detail), cooldown: Self.finishPeekCooldown)
                     }
