@@ -1,8 +1,8 @@
 # Cask for a personal tap (github.com/LLC-AFTeam-Tech/homebrew-tap, Casks/denny-for-agents.rb).
 # After each release: set version, and sha256 from `shasum -a 256 DennyForAgents.zip`.
 cask "denny-for-agents" do
-  version "0.3.1"
-  sha256 "d473b66f329cac1a3402494b46587896aebd3c571831f7346af7303ad80c3b7a"
+  version "0.3.2"
+  sha256 "2513e6953a7e05e2dba50045d41c0b4bee099e4fdb2d12154dc8d232ffd5dc7b"
 
   url "https://github.com/LLC-AFTeam-Tech/denny-for-agents/releases/download/v#{version}/DennyForAgents.zip"
   name "Denny for Agents"
