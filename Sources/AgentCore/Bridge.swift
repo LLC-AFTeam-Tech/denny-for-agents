@@ -25,6 +25,9 @@ public struct BridgeRequest: Codable, Equatable, Sendable {
     /// Ids of jobs the worker has stored since the last exchange. The Mac keeps
     /// a job until its id comes back here; nil from an older hook (no acks).
     public var jobsReceived: [String]?
+    /// A Stop hook that will wait for a reply from the phone (see PhoneReplies).
+    /// The app answers at once with no reply unless the user is away.
+    public var wantsReply: Bool?
 
     public init(id: String, event: HookEvent, wantsDecision: Bool, token: String? = nil, report: UsageReport? = nil) {
         self.version = 1
@@ -40,10 +43,14 @@ public struct BridgeRequest: Codable, Equatable, Sendable {
 public struct BridgeResponse: Codable, Equatable, Sendable {
     public var id: String
     public var decision: ApprovalDecision
+    /// To a Stop hook that asked `wantsReply`: what the user answered from the
+    /// phone, for the agent to go on with; nil to just finish.
+    public var reply: String?
 
-    public init(id: String, decision: ApprovalDecision) {
+    public init(id: String, decision: ApprovalDecision, reply: String? = nil) {
         self.id = id
         self.decision = decision
+        self.reply = reply
     }
 }
 

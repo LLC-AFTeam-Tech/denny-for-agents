@@ -65,7 +65,9 @@ enum HookSetup {
 
     /// After an app update the copied hook may be outdated.
     static func refreshBinaryIfNeeded() {
-        if anyInstalled { _ = try? installBinary() }
+        if anyInstalled, let path = try? installBinary() {
+            for agent in AgentKind.allCases { try? HookInstaller.updateIfOutdated(agent: agent, hookPath: path) }
+        }
         if HookInstaller.isInstalled(agent: .claude) { setStatusLine(true) }
     }
 }

@@ -24,8 +24,11 @@ public struct NightJob: Codable, Equatable, Sendable, Identifiable {
     public var state: State
     /// The server it runs on; nil for this Mac.
     public var host: String?
+    /// A reply from the phone to a finished task: the session it goes on with.
+    public var resume: String?
 
-    public init(agent: AgentKind, folder: String, prompt: String, trigger: Trigger, createdAt: Date = Date(), host: String? = nil) {
+    public init(agent: AgentKind, folder: String, prompt: String, trigger: Trigger, createdAt: Date = Date(),
+                host: String? = nil, resume: String? = nil) {
         self.id = UUID().uuidString
         self.agent = agent
         self.folder = folder
@@ -34,6 +37,7 @@ public struct NightJob: Codable, Equatable, Sendable, Identifiable {
         self.createdAt = createdAt
         self.state = .waiting
         self.host = host
+        self.resume = resume
     }
 }
 
@@ -103,10 +107,16 @@ public enum NightShift {
 
     /// The headless command line: Claude accepts edits (commands go through
     /// the hook's policy); Codex works in its workspace sandbox, offline.
+    /// A continuation resumes the session with full context; Claude forks it,
+    /// so a terminal still open on the original isn't written to underneath.
     public static func arguments(_ job: NightJob) -> [String] {
-        switch job.agent {
-        case .claude: return ["-p", job.prompt, "--permission-mode", "acceptEdits"]
-        case .codex: return ["exec", "--sandbox", "workspace-write", "--skip-git-repo-check", job.prompt]
+        switch (job.agent, job.resume) {
+        case (.claude, nil): return ["-p", job.prompt, "--permission-mode", "acceptEdits"]
+        case (.claude, let session?):
+            return ["-p", job.prompt, "--resume", session, "--fork-session", "--permission-mode", "acceptEdits"]
+        case (.codex, nil): return ["exec", "--sandbox", "workspace-write", "--skip-git-repo-check", job.prompt]
+        case (.codex, let session?):
+            return ["exec", "--sandbox", "workspace-write", "--skip-git-repo-check", "resume", session, job.prompt]
         }
     }
 }

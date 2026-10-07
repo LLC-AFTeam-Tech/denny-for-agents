@@ -23,6 +23,8 @@ final class AgentsController {
     private var swipeMonitor: Any?
     private let telegram = TelegramBridge.shared
     private var nightSessions: Set<String> = []
+    /// Session key -> the Stop hook waiting for a reply from the phone.
+    private var heldStops: [String: (id: String, since: Date)] = [:]
     private var nightProcess: Process?
     /// Queued and finished night-shift jobs, saved in ~/.denny-for-agents.
     private(set) var nightJobs = NightShift.load()
@@ -62,6 +64,8 @@ final class AgentsController {
         NightShift.save(nightJobs)
         restoreServerReports()
         telegram.onDecision = { [weak self] id, decision in self?.answer(id: id, decision: decision) }
+        telegram.onReply = { [weak self] task, text, message in self?.phoneReplied(task, text: text, message: message) }
+        server.onReplyOffered = { [weak self] event, id in self?.holdForReply(event, id: id) ?? false }
         telegram.start()
         swipeMonitor = NSEvent.addLocalMonitorForEvents(matching: .scrollWheel) { [weak self] event in
             guard let self else { return event }
@@ -215,8 +219,11 @@ final class AgentsController {
                     }
                 }
                 if telegram.settings.sendFinished, let session = store.sessions[key] {
-                    telegram.send("✅ " + L.finishedTitle(session.agent) + " · "
-                                  + (duration.map { L.finishedBody(session.projectName, Fmt.countdown($0)) } ?? session.projectName))
+                    let task = session.cwd.map { PhoneReplies.Task(agent: session.agent, sessionId: session.sessionId,
+                                                                   folder: $0, host: session.host) }
+                    telegram.sendFinished("✅ " + L.finishedTitle(session.agent) + " · "
+                                          + (duration.map { L.finishedBody(session.projectName, Fmt.countdown($0)) } ?? session.projectName),
+                                          task: task.flatMap { PhoneReplies.isValidSession($0.sessionId) ? $0 : nil })
                 }
                 if !settings.isQuiet, notifier.settings.notifiesFinish(after: duration), let session = store.sessions[key] {
                     notifier.post(title: L.finishedTitle(session.agent),
@@ -364,6 +371,47 @@ final class AgentsController {
         render()
     }
 
+    // MARK: - Replies from the phone
+
+    /// A task finished while the user is away: its Stop hook waits for what they
+    /// answer to "done" in Telegram, and the agent goes on in the same terminal.
+    private func holdForReply(_ event: HookEvent, id: String) -> Bool {
+        guard event.nightShift == nil, event.cwd != nil, PhoneReplies.isValidSession(event.sessionId),
+              telegram.isConnected, telegram.settings.sendFinished, telegram.isAway else { return false }
+        let key = AgentStore.key(agent: event.agent, sessionId: event.sessionId)
+        if let older = heldStops[key] { server.reply(id: older.id, text: nil) }
+        heldStops[key] = (id, Date())
+        return true
+    }
+
+    /// The user is back at the Mac, or nobody answered: the terminal is theirs again.
+    private func releaseHeldStops() {
+        let away = telegram.isAway
+        for (key, held) in heldStops where !away || Date().timeIntervalSince(held.since) > PhoneReplies.holdSeconds
+            || !server.isWaitingForReply(id: held.id) {
+            server.reply(id: held.id, text: nil)
+            heldStops[key] = nil
+        }
+    }
+
+    private func phoneReplied(_ task: PhoneReplies.Task, text: String, message: Int64) {
+        let reply = PhoneReplies.clean(text)
+        guard !reply.isEmpty else { return }
+        let key = AgentStore.key(agent: task.agent, sessionId: task.sessionId)
+        if let held = heldStops.removeValue(forKey: key), server.reply(id: held.id, text: reply) {
+            telegram.answer(message, text: "▶️ " + L.phoneReplyLive(task.agent))
+            return
+        }
+        // Too late for the waiting hook: resume the session in the background.
+        guard let job = PhoneReplies.continuation(task, reply: reply) else {
+            telegram.answer(message, text: L.phoneReplyFailed)
+            return
+        }
+        addNightJob(job)
+        telegram.answer(message, text: "▶️ " + L.phoneReplyBackground(task.agent, task.host ?? (task.folder as NSString).lastPathComponent))
+        render()
+    }
+
     private func tick() {
         // The hook stops waiting after approvalWaitSeconds and hands the
         // question back to the terminal; drop the card at the same time.
@@ -373,6 +421,7 @@ final class AgentsController {
             server.answer(id: approval.id, decision: .ask)
             telegram.finish(id: approval.id, text: L.phoneExpired)
         }
+        releaseHeldStops()
         store.prune()
         refreshHooksState()
         if settings.quietUntil != nil, !settings.isQuiet { settings.quietUntil = nil }

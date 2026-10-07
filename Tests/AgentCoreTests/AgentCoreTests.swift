@@ -1366,3 +1366,99 @@ final class JobOutboxTests: XCTestCase {
         XCTAssertEqual(outbox.deliver(host: "srv", received: nil).map(\.id), [])
     }
 }
+
+final class PhoneRepliesTests: XCTestCase {
+    func testTheAgentGoesOnWithTheReply() throws {
+        let output = try XCTUnwrap(HookOutput.stopContinuation("  add tests  "))
+        let json = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(output.utf8)) as? [String: String])
+        XCTAssertEqual(json["decision"], "block")
+        XCTAssertTrue(json["reason"]?.hasSuffix("\n\nadd tests") == true)
+        XCTAssertNil(HookOutput.stopContinuation("   "))
+    }
+
+    func testALateReplyResumesTheSessionInTheBackground() throws {
+        let now = Date(timeIntervalSince1970: 1_000)
+        let task = PhoneReplies.Task(agent: .claude, sessionId: "abc-123", folder: "/srv/app", host: "srv")
+        let job = try XCTUnwrap(PhoneReplies.continuation(task, reply: "add tests", now: now))
+        XCTAssertEqual(job.trigger, .at(now))
+        XCTAssertEqual(job.host, "srv")
+        XCTAssertEqual(Array(NightShift.arguments(job).suffix(5)), ["--resume", "abc-123", "--fork-session", "--permission-mode", "acceptEdits"])
+        XCTAssertEqual(RemoteJob(night: job).resume, "abc-123")
+        var codex = job
+        codex.agent = .codex
+        XCTAssertEqual(Array(NightShift.arguments(codex).suffix(3)), ["resume", "abc-123", job.prompt])
+    }
+
+    func testASessionIdNeverPassesForAnOption() {
+        XCTAssertTrue(PhoneReplies.isValidSession("0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b"))
+        for bad in ["", "--help", "-r", "a b", "a;rm", String(repeating: "a", count: 129)] {
+            XCTAssertFalse(PhoneReplies.isValidSession(bad), bad)
+            XCTAssertNil(PhoneReplies.continuation(PhoneReplies.Task(agent: .claude, sessionId: bad, folder: "/x"), reply: "go"))
+        }
+    }
+
+    func testTheBookKeepsTheNewestMessagesAndSurvivesARestart() {
+        var book = PhoneReplies.Book()
+        for message in 1...(PhoneReplies.Book.keep + 5) {
+            book.remember(PhoneReplies.Task(agent: .codex, sessionId: "s\(message)", folder: "/x"), message: Int64(message))
+        }
+        XCTAssertNil(book.task(for: 1))
+        XCTAssertEqual(book.task(for: Int64(PhoneReplies.Book.keep + 5))?.sessionId, "s\(PhoneReplies.Book.keep + 5)")
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("book-\(UUID().uuidString).json")
+        defer { try? FileManager.default.removeItem(at: url) }
+        book.save(to: url)
+        XCTAssertEqual(PhoneReplies.Book.load(from: url), book)
+    }
+
+    func testStopMayWaitForTheReply() {
+        let table = HookInstaller.merged(config: [:], agent: .codex, hookPath: "/x/denny-hook")
+        let stop = ((table["Stop"] as? [[String: Any]])?.first?["hooks"] as? [[String: Any]])?.first
+        XCTAssertEqual(stop?["timeout"] as? Int, HookInstaller.replyTimeoutSeconds)
+        XCTAssertGreaterThan(HookInstaller.replyTimeoutSeconds, HookInstaller.replyWaitSeconds)
+        XCTAssertLessThan(PhoneReplies.holdSeconds, TimeInterval(HookInstaller.replyWaitSeconds))
+    }
+
+    func testAnOldNightJobFileStillLoads() throws {
+        let job = NightJob(agent: .claude, folder: "/x", prompt: "go", trigger: .at(Date(timeIntervalSince1970: 5)))
+        var object = try XCTUnwrap(JSONSerialization.jsonObject(with: JSONEncoder().encode(job)) as? [String: Any])
+        object["resume"] = nil
+        let decoded = try JSONDecoder().decode(NightJob.self, from: JSONSerialization.data(withJSONObject: object))
+        XCTAssertNil(decoded.resume)
+    }
+}
+
+final class HookUpdateTests: XCTestCase {
+    func testHooksFromAnOlderVersionAreBroughtUpToDate() throws {
+        let home = FileManager.default.temporaryDirectory.appendingPathComponent("home-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: home) }
+        try HookInstaller.install(agent: .claude, hookPath: "/x/denny-hook", home: home)
+        let url = HookInstaller.configURL(for: .claude, home: home)
+        var config = try HookInstaller.readConfig(at: url)
+        XCTAssertFalse(HookInstaller.isOutdated(config: config, agent: .claude))
+        // What 0.3.0 wrote: Stop with the short timeout.
+        var hooks = try XCTUnwrap(config["hooks"] as? [String: Any])
+        hooks["Stop"] = [["hooks": [["type": "command", "command": "'/x/denny-hook' claude", "timeout": 5]]]]
+        config["hooks"] = hooks
+        config["model"] = "opus"
+        try HookInstaller.writeConfig(config, to: url)
+        XCTAssertTrue(HookInstaller.isOutdated(config: config, agent: .claude))
+        try HookInstaller.updateIfOutdated(agent: .claude, hookPath: "/x/denny-hook", home: home)
+        let updated = try HookInstaller.readConfig(at: url)
+        XCTAssertFalse(HookInstaller.isOutdated(config: updated, agent: .claude))
+        XCTAssertEqual(updated["model"] as? String, "opus")
+    }
+}
+
+final class PeerClosedTests: XCTestCase {
+    func testAHungUpPeerIsNoticedBeforeWriting() throws {
+        let path = FileManager.default.temporaryDirectory.appendingPathComponent("p\(UInt16.random(in: 0...9999)).sock").path
+        defer { unlink(path) }
+        let listener = try XCTUnwrap(UnixSocket.listen(path: path))
+        var client: UnixSocket? = try XCTUnwrap(UnixSocket.connect(path: path))
+        let server = try XCTUnwrap(listener.accept())
+        XCTAssertFalse(server.peerHasClosed)
+        client?.close()
+        client = nil
+        XCTAssertTrue(server.peerHasClosed)
+    }
+}

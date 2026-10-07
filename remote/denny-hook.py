@@ -49,6 +49,10 @@ MAX_FILES_LINE = 40 << 20
 APPROVAL_WAIT_SECONDS = 300
 APPROVAL_TIMEOUT_SECONDS = 600
 EVENT_TIMEOUT_SECONDS = 5
+# Stop may wait for a reply from the phone (only while the user is away).
+REPLY_WAIT_SECONDS = 600
+REPLY_TIMEOUT_SECONDS = 660
+MAX_REPLY = 4000
 CONNECT_TIMEOUT_SECONDS = 0.5
 
 KNOWN_EVENTS = {
@@ -234,6 +238,38 @@ def send_request(event, port, token, wants_decision):
         conn.close()
 
 
+def wait_for_reply(event, port, token):
+    """Stop: Denny holds the request while the user is away, and answers with
+    what they replied to "done" in Telegram (or nothing). Mirrors DennyHook."""
+    conn = connect(port)
+    if conn is None:
+        return None
+    try:
+        request = {"version": 1, "id": str(uuid.uuid4()), "event": event,
+                   "wantsDecision": False, "wantsReply": True, "token": token}
+        conn.sendall((json.dumps(request) + "\n").encode())
+        line = read_line(conn, REPLY_WAIT_SECONDS)
+        if line is None:
+            return None
+        response = json.loads(line)
+        if response.get("id") != request["id"] or not isinstance(response.get("reply"), str):
+            return None
+        return response["reply"].strip()[:MAX_REPLY] or None
+    except (OSError, ValueError, AttributeError):
+        return None
+    finally:
+        conn.close()
+
+
+def reply_instruction(text):
+    return "The user replied from their phone (Telegram) with what to do next:\n\n" + text
+
+
+def stop_continuation(text):
+    """Claude Code and Codex both go on with `decision: block` + `reason`."""
+    return json.dumps({"decision": "block", "reason": reply_instruction(text)}, sort_keys=True)
+
+
 def safe_part(name):
     name = os.path.basename(str(name or "").replace("\x00", "")).strip()
     return "file" if name in ("", ".", "..") else name
@@ -323,6 +359,13 @@ def run_hook(agent):
                 event["turnUsage"] = usage
         except Exception:
             pass
+    if event["name"] == "Stop" and not night:
+        reply = wait_for_reply(event, config[0], config[1])
+        if reply:
+            sys.stdout.write(stop_continuation(reply) + "\n")
+        sys.stdout.flush()
+        send_report_in_background(config[0], config[1])
+        return
     wants_decision = event["name"] == "PermissionRequest"
     decision = send_request(event, config[0], config[1], wants_decision)
     if wants_decision:
@@ -1216,14 +1259,26 @@ def night_due(job, now):
     return True
 
 
+def valid_session(value):
+    return isinstance(value, str) and 0 < len(value) <= 128 and not value.startswith("-") \
+        and all(c.isascii() and (c.isalnum() or c in "-_") for c in value)
+
+
 def start_night_job(job):
     binary = agent_binary(job.get("agent"))
     if not binary or not os.path.isdir(job.get("cwd") or ""):
         return None, "not found"
+    resume = job.get("resume")
+    if resume is not None and not valid_session(resume):
+        return None, "bad session"
+    # A reply from the phone resumes its session (Claude forks it, so a
+    # terminal still open on the original isn't written to underneath).
     if job.get("agent") == "codex":
-        arguments = ["exec", "--sandbox", "workspace-write", "--skip-git-repo-check", job.get("prompt", "")]
+        arguments = ["exec", "--sandbox", "workspace-write", "--skip-git-repo-check"] \
+            + (["resume", resume] if resume else []) + [job.get("prompt", "")]
     else:
-        arguments = ["-p", job.get("prompt", ""), "--permission-mode", "acceptEdits"]
+        arguments = ["-p", job.get("prompt", "")] + (["--resume", resume, "--fork-session"] if resume else []) \
+            + ["--permission-mode", "acceptEdits"]
     try:
         process = subprocess.Popen(["nice", "-n", "5", "bash", "-lc", '"$0" "$@"', binary] + arguments,
                                    cwd=job["cwd"], env=dict(os.environ, **{NIGHT_ENV: job["id"]}),
@@ -2057,6 +2112,8 @@ def merged(config, agent):
             timeout = APPROVAL_TIMEOUT_SECONDS
         elif event in ("UserPromptSubmit", "SessionStart"):
             timeout = FILES_WAIT_SECONDS + 5
+        elif event == "Stop":
+            timeout = REPLY_TIMEOUT_SECONDS
         else:
             timeout = EVENT_TIMEOUT_SECONDS
         table.setdefault(event, []).append(

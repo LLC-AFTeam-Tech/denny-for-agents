@@ -27,4 +27,14 @@ public enum HookOutput {
         }
         return String(data: data, encoding: .utf8)
     }
+
+    /// Stop: the agent goes on with what the user answered from the phone.
+    /// Claude Code and Codex both read `decision: block` + `reason` this way.
+    public static func stopContinuation(_ reply: String) -> String? {
+        let text = PhoneReplies.clean(reply)
+        guard !text.isEmpty else { return nil }
+        let output = ["decision": "block", "reason": PhoneReplies.instruction(text)]
+        guard let data = try? JSONSerialization.data(withJSONObject: output, options: [.sortedKeys]) else { return nil }
+        return String(data: data, encoding: .utf8)
+    }
 }

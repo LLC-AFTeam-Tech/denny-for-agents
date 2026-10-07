@@ -21,6 +21,8 @@ public struct RemoteJob: Codable, Equatable, Sendable, Identifiable {
     public var at: Double?
     /// Cancel: the night job to stop.
     public var target: String?
+    /// Night: the session a reply from the phone goes on with.
+    public var resume: String?
 
     public init(id: String = UUID().uuidString, kind: Kind, cwd: String? = nil, files: [String]? = nil,
                 author: AgentKind? = nil, task: String? = nil, agent: AgentKind? = nil, prompt: String? = nil,
@@ -46,6 +48,7 @@ public struct RemoteJob: Codable, Equatable, Sendable, Identifiable {
         case .at(let date): at = date.timeIntervalSince1970
         }
         self.init(id: job.id, kind: .night, cwd: job.folder, agent: job.agent, prompt: job.prompt, resetsAt: resetsAt, at: at)
+        resume = job.resume
     }
 }
 

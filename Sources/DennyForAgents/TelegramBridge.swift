@@ -30,12 +30,20 @@ final class TelegramBridge: ObservableObject {
 
     /// Main thread: a button was pressed on the phone.
     var onDecision: ((String, ApprovalDecision) -> Void)?
+    /// Main thread: the user replied to a "done" message — the task, their
+    /// text and the reply's message id (to answer under it).
+    var onReply: ((PhoneReplies.Task, String, Int64) -> Void)?
 
     private var token: String?
     private var polling = false
     private var offset: Int64 = 0
     /// approval id -> Telegram message id
     private var messages: [String: Int64] = [:]
+    private static var bookURL: URL { BridgePaths.directory().appendingPathComponent("telegram-replies.json") }
+    /// "Done" messages a reply can go on with (main thread).
+    private var book = PhoneReplies.Book.load(from: TelegramBridge.bookURL) {
+        didSet { book.save(to: Self.bookURL) }
+    }
     private let lock = NSLock()
 
     private init() {
@@ -92,7 +100,12 @@ final class TelegramBridge: ObservableObject {
     /// Away from the Mac: no mouse or keyboard for a couple of minutes.
     var shouldForward: Bool {
         guard isConnected else { return false }
-        if settings.alwaysSend { return true }
+        return settings.alwaysSend || isAway
+    }
+
+    /// Really away, whatever "always send" says: only then may a finished
+    /// task's terminal wait for a reply from the phone.
+    var isAway: Bool {
         let anyEvent = CGEventType(rawValue: ~0)!
         return CGEventSource.secondsSinceLastEventType(.combinedSessionState, eventType: anyEvent) >= Self.awayAfter
     }
@@ -114,6 +127,22 @@ final class TelegramBridge: ObservableObject {
         guard let chat = settings.chatId, let messageId = locked({ messages.removeValue(forKey: id) }) else { return }
         call("editMessageReplyMarkup", params: ["chat_id": chat, "message_id": messageId, "reply_markup": ["inline_keyboard": [Any]()]])
         call("sendMessage", params: target(chat).merging(["text": text, "reply_to_message_id": messageId]) { $1 })
+    }
+
+    /// "Done", answerable: a reply tells the agent what to do next.
+    func sendFinished(_ text: String, task: PhoneReplies.Task?) {
+        guard shouldForward, let chat = settings.chatId else { return }
+        let body = task == nil ? text : text + "\n\n" + L.phoneReplyHint
+        call("sendMessage", params: target(chat).merging(["text": body]) { $1 }) { [weak self] result in
+            guard let task, let messageId = (result as? [String: Any])?["message_id"] as? Int64 else { return }
+            self?.book.remember(task, message: messageId)
+        }
+    }
+
+    /// An answer under the user's own message.
+    func answer(_ message: Int64, text: String) {
+        guard isConnected, let chat = settings.chatId else { return }
+        call("sendMessage", params: target(chat).merging(["text": text, "reply_to_message_id": message]) { $1 })
     }
 
     func send(_ text: String, force: Bool = false) {
@@ -165,8 +194,14 @@ final class TelegramBridge: ObservableObject {
             let from = message["from"] as? [String: Any]
             let name = from?["first_name"] as? String ?? chat["title"] as? String
             let thread = message["message_thread_id"] as? Int64
+            let repliedTo = (message["reply_to_message"] as? [String: Any])?["message_id"] as? Int64
+            let messageId = message["message_id"] as? Int64
             DispatchQueue.main.async {
-                self.pair(chatId: chatId, threadId: thread, userId: from?["id"] as? Int64, name: name, text: text)
+                if let repliedTo, let messageId {
+                    self.reply(chatId: chatId, userId: from?["id"] as? Int64, to: repliedTo, message: messageId, text: text)
+                } else {
+                    self.pair(chatId: chatId, threadId: thread, userId: from?["id"] as? Int64, name: name, text: text)
+                }
             }
         }
         guard let query = update["callback_query"] as? [String: Any], let queryId = query["id"] as? String else { return }
@@ -187,6 +222,17 @@ final class TelegramBridge: ObservableObject {
                                                       "text": known ? (decision == .allow ? L.phoneAllowed : L.phoneDenied) : L.phoneExpired])
             if known { self.onDecision?(id, decision) }
         }
+    }
+
+    /// Only the paired chat and person; only replies to a "done" message.
+    private func reply(chatId: Int64, userId: Int64?, to repliedTo: Int64, message: Int64, text: String) {
+        guard chatId == settings.chatId, settings.userId == nil || userId == settings.userId else { return }
+        // In a group, people reply to each other too: stay quiet unless it's to the bot's own message.
+        guard let task = book.task(for: repliedTo) else {
+            if chatId > 0 { answer(message, text: L.phoneReplyUnknown) }
+            return
+        }
+        onReply?(task, text, message)
     }
 
     /// The first message carrying the code binds the bot to that chat, that

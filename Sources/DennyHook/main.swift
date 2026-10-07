@@ -42,8 +42,22 @@ func finish() -> Never {
 guard let socket = UnixSocket.connect(path: BridgePaths.socket().path) else { finish() }
 
 let wantsDecision = event.name == .permissionRequest
-let request = BridgeRequest(id: UUID().uuidString, event: event, wantsDecision: wantsDecision)
+// A finished task may wait for what the user answers from the phone; Denny
+// replies at once (nothing) unless they're away. Never for the night shift.
+let wantsReply = event.name == .stop && event.nightShift == nil
+var request = BridgeRequest(id: UUID().uuidString, event: event, wantsDecision: wantsDecision)
+if wantsReply { request.wantsReply = true }
 guard let line = try? BridgeCodec.encodeLine(request), socket.write(line) else { finish() }
+if wantsReply {
+    socket.setReceiveTimeout(seconds: HookInstaller.replyWaitSeconds)
+    if let reply = socket.readLine(),
+       let response = try? BridgeCodec.decode(BridgeResponse.self, line: reply),
+       response.id == request.id, let text = response.reply,
+       let output = HookOutput.stopContinuation(text) {
+        FileHandle.standardOutput.write(Data((output + "\n").utf8))
+    }
+    exit(0)
+}
 guard wantsDecision else { finish() }
 
 socket.setReceiveTimeout(seconds: HookInstaller.approvalWaitSeconds)

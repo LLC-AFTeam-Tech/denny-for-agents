@@ -49,7 +49,7 @@ Running the same command for the third time, editing the same file again and aga
 - 👀 **Cross-review:** one click and the other agent reviews what this one just changed — Codex checks Claude, Claude checks Codex — read-only, in the language of your task. Findings show up in the notch, ready to send back to the author.
 - 👆 Swipe two fingers on the open notch to flip between the overview and the stats.
 - ⏱️ A live number by the camera: the current task's timer while an agent works, your tightest limit at rest.
-- 📱 **Approve from your phone.** Away from the Mac? Requests come to Telegram through your own bot with ✅ Allow / ❌ Deny buttons, risky ones flagged by the guard. Paired by a one-time code, so the bot obeys only you.
+- 📱 **Approve from your phone.** Away from the Mac? Requests come to Telegram through your own bot with ✅ Allow / ❌ Deny buttons, risky ones flagged by the guard. Paired by a one-time code, so the bot obeys only you. And you can simply reply to a "✅ done" message — "now add tests" — and the agent carries on with the same task: while you're away, in the same terminal (it waits up to 10 minutes and frees the terminal the moment you're back); later on, in the background, resuming the same session under the night shift's careful mode.
 - 🖥️ **Agents on SSH servers too** — one forwarded port and Denny on your Mac sees the agent on the server, approvals included.
 
 **Limits and money**

@@ -142,6 +142,14 @@ public final class UnixSocket {
         _ = setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size))
     }
 
+    /// The other side hung up (a hook killed by its timeout, say). A write
+    /// would still "succeed" into the kernel buffer and be lost.
+    public var peerHasClosed: Bool {
+        var byte: UInt8 = 0
+        let received = recv(fd, &byte, 1, Int32(MSG_PEEK | MSG_DONTWAIT))
+        return received == 0 || (received < 0 && errno != EAGAIN && errno != EWOULDBLOCK)
+    }
+
     @discardableResult
     public func write(_ data: Data) -> Bool {
         data.withUnsafeBytes { raw -> Bool in

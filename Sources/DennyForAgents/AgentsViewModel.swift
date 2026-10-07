@@ -326,6 +326,11 @@ struct L {
     static var phoneAllowed: String { t("phone.allowed") }
     static var phoneDenied: String { t("phone.denied") }
     static var phoneExpired: String { t("phone.expired") }
+    static var phoneReplyHint: String { t("phone.replyHint") }
+    static var phoneReplyUnknown: String { t("phone.replyUnknown") }
+    static func phoneReplyLive(_ agent: AgentKind) -> String { t("phone.replyLive", agent.displayName) }
+    static func phoneReplyBackground(_ agent: AgentKind, _ place: String) -> String { t("phone.replyBackground", agent.displayName, place) }
+    static var phoneReplyFailed: String { t("phone.replyFailed") }
     static var phoneBadToken: String { t("phone.badToken") }
     static var phonePaired: String { t("phone.paired") }
     static var phoneTitle: String { t("phone.title") }

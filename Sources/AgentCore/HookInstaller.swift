@@ -12,6 +12,9 @@ public enum HookInstaller {
     public static let approvalTimeoutSeconds = 600
     public static let approvalWaitSeconds = 300
     public static let eventTimeoutSeconds = 5
+    /// Stop may wait for an answer from the phone (only while the user is away).
+    public static let replyTimeoutSeconds = 660
+    public static let replyWaitSeconds = 600
 
     public static func events(for agent: AgentKind) -> [HookEventName] {
         switch agent {
@@ -42,7 +45,8 @@ public enum HookInstaller {
         table = removingOurs(from: table)
         for event in events(for: agent) {
             var entries = table[event.rawValue] as? [Any] ?? []
-            let timeout = event == .permissionRequest ? approvalTimeoutSeconds : eventTimeoutSeconds
+            let timeout = event == .permissionRequest ? approvalTimeoutSeconds
+                : event == .stop ? replyTimeoutSeconds : eventTimeoutSeconds
             entries.append([
                 "hooks": [[
                     "type": "command",
@@ -58,6 +62,20 @@ public enum HookInstaller {
     public static func removed(config: [String: Any], agent: AgentKind) -> [String: Any] {
         let table = removingOurs(from: hooksTable(in: config, agent: agent))
         return withHooksTable(table, in: config, agent: agent)
+    }
+
+    /// Installed, but by an older version: an event missing or a different timeout
+    /// (Stop got a longer one to wait for replies from the phone).
+    public static func isOutdated(config: [String: Any], agent: AgentKind) -> Bool {
+        let table = hooksTable(in: config, agent: agent)
+        guard isInstalled(config: config, agent: agent) else { return false }
+        return events(for: agent).contains { event in
+            let expected = event == .permissionRequest ? approvalTimeoutSeconds
+                : event == .stop ? replyTimeoutSeconds : eventTimeoutSeconds
+            let ours = (table[event.rawValue] as? [Any] ?? []).first(where: isOurEntry) as? [String: Any]
+            let timeout = ((ours?["hooks"] as? [Any])?.first as? [String: Any])?["timeout"] as? Int
+            return timeout != expected
+        }
     }
 
     public static func isInstalled(config: [String: Any], agent: AgentKind) -> Bool {
@@ -149,6 +167,15 @@ public enum HookInstaller {
         let config = try readConfig(at: url)
         guard isInstalled(config: config, agent: agent) else { return }
         try writeConfig(removed(config: config, agent: agent), to: url)
+    }
+
+    /// After an app update: brings our entries up to date, leaving the rest alone.
+    public static func updateIfOutdated(agent: AgentKind, hookPath: String,
+                                        home: URL = FileManager.default.homeDirectoryForCurrentUser) throws {
+        let url = configURL(for: agent, home: home)
+        let config = try readConfig(at: url)
+        guard isOutdated(config: config, agent: agent) else { return }
+        try writeConfig(merged(config: config, agent: agent, hookPath: hookPath), to: url)
     }
 
     public static func isInstalled(agent: AgentKind, home: URL = FileManager.default.homeDirectoryForCurrentUser) -> Bool {

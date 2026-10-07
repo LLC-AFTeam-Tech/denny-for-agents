@@ -193,6 +193,7 @@ class HookTests(unittest.TestCase):
         codex = json.load(open(hook.CONFIG_FILES["codex"]))
         self.assertEqual(set(codex), set(hook.EVENTS["codex"]))
         self.assertEqual(codex["PermissionRequest"][0]["hooks"][0]["timeout"], hook.APPROVAL_TIMEOUT_SECONDS)
+        self.assertEqual(codex["Stop"][0]["hooks"][0]["timeout"], hook.REPLY_TIMEOUT_SECONDS)
         self.assertEqual(codex["UserPromptSubmit"][0]["hooks"][0]["timeout"], hook.FILES_WAIT_SECONDS + 5)
         self.assertTrue(os.path.exists(hook.INSTALLED_SCRIPT))
         self.assertEqual(os.stat(hook.CONFIG_PATH).st_mode & 0o777, 0o600)
@@ -887,6 +888,65 @@ class WorkerTests(unittest.TestCase):
             hook.add_result({"id": "n1", "kind": "night", "state": state})
         hook.drop_delivered_results({("n1", "running")})
         self.assertEqual(["done"], [item["state"] for item in hook.load_json_list(hook.RESULTS_PATH)])
+
+
+
+class PhoneReplyTests(unittest.TestCase):
+    def serve_once(self, reply_for):
+        server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        server.bind(("127.0.0.1", 0))
+        server.listen(1)
+        seen = []
+        def serve():
+            conn, _ = server.accept()
+            request = json.loads(hook.read_line(conn, 5))
+            seen.append(request)
+            response = reply_for(request)
+            if response is not None:
+                conn.sendall((json.dumps(response) + "\n").encode())
+            conn.close()
+        thread = threading.Thread(target=serve, daemon=True)
+        thread.start()
+        return server, thread, seen
+
+    def test_stop_waits_and_gets_the_reply(self):
+        server, thread, seen = self.serve_once(lambda r: {"id": r["id"], "decision": "ask", "reply": "  add tests  "})
+        reply = hook.wait_for_reply({"agent": "claude", "name": "Stop", "sessionId": "s"}, server.getsockname()[1], "t" * 48)
+        thread.join(2)
+        server.close()
+        self.assertEqual("add tests", reply)
+        self.assertTrue(seen[0]["wantsReply"])
+
+    def test_no_reply_or_an_older_app_means_just_finish(self):
+        for answer in (lambda r: {"id": r["id"], "decision": "ask"}, lambda r: None):
+            server, thread, _ = self.serve_once(answer)
+            self.assertIsNone(hook.wait_for_reply({"name": "Stop"}, server.getsockname()[1], "t" * 48))
+            thread.join(2)
+            server.close()
+
+    def test_the_agent_goes_on_with_the_reply(self):
+        output = json.loads(hook.stop_continuation("add tests"))
+        self.assertEqual("block", output["decision"])
+        self.assertTrue(output["reason"].endswith("add tests"))
+
+    def test_a_reply_resumes_its_session_and_a_bad_id_is_refused(self):
+        calls = []
+        class FakeProcess:
+            def __init__(self, args, **kwargs):
+                calls.append(args)
+        original_popen, original_binary = hook.subprocess.Popen, hook.agent_binary
+        hook.subprocess.Popen, hook.agent_binary = FakeProcess, lambda agent: "/bin/" + agent
+        folder = tempfile.mkdtemp()
+        try:
+            hook.start_night_job({"id": "n", "agent": "claude", "cwd": folder, "prompt": "go", "resume": "abc-123"})
+            hook.start_night_job({"id": "n", "agent": "codex", "cwd": folder, "prompt": "go", "resume": "abc-123"})
+            process, error = hook.start_night_job({"id": "n", "agent": "claude", "cwd": folder, "prompt": "go", "resume": "--help"})
+        finally:
+            hook.subprocess.Popen, hook.agent_binary = original_popen, original_binary
+        self.assertEqual(["-p", "go", "--resume", "abc-123", "--fork-session", "--permission-mode", "acceptEdits"], calls[0][-7:])
+        self.assertEqual(["resume", "abc-123", "go"], calls[1][-3:])
+        self.assertEqual((None, "bad session"), (process, error))
+        self.assertEqual(2, len(calls))
 
 
 if __name__ == "__main__":
