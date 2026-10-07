@@ -22,8 +22,10 @@ public struct NightJob: Codable, Equatable, Sendable, Identifiable {
     public var trigger: Trigger
     public var createdAt: Date
     public var state: State
+    /// The server it runs on; nil for this Mac.
+    public var host: String?
 
-    public init(agent: AgentKind, folder: String, prompt: String, trigger: Trigger, createdAt: Date = Date()) {
+    public init(agent: AgentKind, folder: String, prompt: String, trigger: Trigger, createdAt: Date = Date(), host: String? = nil) {
         self.id = UUID().uuidString
         self.agent = agent
         self.folder = folder
@@ -31,6 +33,7 @@ public struct NightJob: Codable, Equatable, Sendable, Identifiable {
         self.trigger = trigger
         self.createdAt = createdAt
         self.state = .waiting
+        self.host = host
     }
 }
 

@@ -18,8 +18,13 @@ guard var event = try? HookEvent.parse(payload, agent: agent) else { exit(0) }
 if event.name == .preToolUse {
     event.snapshot = SafetyNet.take(command: SafetyNet.command(fromPayload: payload), cwd: event.cwd, agent: agent.rawValue)
 }
-if event.name == .stop, agent == .claude, let transcript = TurnUsage.transcriptPath(fromPayload: payload) {
-    let usage = TurnUsage.claude(transcript: transcript)
+if event.name == .stop {
+    var usage: [UsageReport.Item] = []
+    if agent == .claude, let transcript = TurnUsage.transcriptPath(fromPayload: payload) {
+        usage = TurnUsage.claude(transcript: transcript)
+    } else if agent == .codex, let rollout = TurnUsage.codexRollout(payload: payload) {
+        usage = TurnUsage.codex(rollout: rollout)
+    }
     if !usage.isEmpty { event.turnUsage = usage }
 }
 // Night shift: nobody is here to click Allow, so the careful policy answers

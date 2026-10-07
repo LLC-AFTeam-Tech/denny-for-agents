@@ -19,6 +19,12 @@ public struct BridgeRequest: Codable, Equatable, Sendable {
     public var report: UsageReport?
     /// The remote hook waits for a FileDelivery line in reply.
     public var wantsFiles: Bool?
+    /// The server worker waits for a JobBatch line in reply.
+    public var wantsJobs: Bool?
+    public var jobResults: [RemoteJobResult]?
+    /// Ids of jobs the worker has stored since the last exchange. The Mac keeps
+    /// a job until its id comes back here; nil from an older hook (no acks).
+    public var jobsReceived: [String]?
 
     public init(id: String, event: HookEvent, wantsDecision: Bool, token: String? = nil, report: UsageReport? = nil) {
         self.version = 1

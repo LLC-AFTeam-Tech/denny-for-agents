@@ -10,6 +10,7 @@ from importlib.machinery import SourceFileLoader
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 hook = SourceFileLoader("denny_hook", os.path.join(HERE, "denny-hook.py")).load_module()
+hook.start_worker = lambda: None  # tests never spawn the background worker
 
 
 class FakeDenny:
@@ -72,6 +73,18 @@ class HookTests(unittest.TestCase):
         os.makedirs(hook.BASE_DIR, exist_ok=True)
         with open(hook.CONFIG_PATH, "w") as handle:
             json.dump({"port": port, "token": token}, handle)
+
+    def test_set_port_moves_the_hook_and_keeps_the_token(self):
+        self.write_config(47321, "k" * 48)
+        self.assertEqual(0, hook.main(["denny-hook.py", "--set-port", "47323"]))
+        self.assertEqual((47323, "k" * 48), hook.load_config())
+        self.assertEqual(0o600, os.stat(hook.CONFIG_PATH).st_mode & 0o777)
+        self.assertEqual(2, hook.set_port(80))
+        self.assertEqual((47323, "k" * 48), hook.load_config())
+
+    def test_set_port_without_a_connection_does_nothing(self):
+        self.assertEqual(1, hook.set_port(47322))
+        self.assertIsNone(hook.load_config())
 
     def test_event_shape_matches_swift(self):
         event = hook.build_event({
@@ -628,6 +641,252 @@ class TurnUsageTests(unittest.TestCase):
         self.assertEqual(usage[0]["input"], 2)
         self.assertEqual(usage[1]["output"], 7)
         self.assertEqual(hook.turn_usage(os.path.join(tempfile.mkdtemp(), "missing.jsonl")), [])
+
+
+class CodexTurnUsageTests(unittest.TestCase):
+    @staticmethod
+    def tokens(total_in, total_cached, total_out):
+        return {"type": "event_msg", "payload": {"type": "token_count", "info": {
+            "total_token_usage": {"input_tokens": total_in, "cached_input_tokens": total_cached, "output_tokens": total_out},
+            "last_token_usage": {"input_tokens": 0, "cached_input_tokens": 0, "output_tokens": 0}}}}
+
+    def test_current_format_task_markers_and_new_prompt_shapes(self):
+        # Today's Codex: task_started, the prompt as response_item role=user AND
+        # item_completed UserMessage (no old user_message). Counted once.
+        path = os.path.join(tempfile.mkdtemp(), "rollout-new.jsonl")
+        jsonl(path, [
+            {"type": "turn_context", "payload": {"model": "gpt-5.6-sol"}},
+            {"type": "event_msg", "payload": {"type": "task_started"}},
+            {"type": "response_item", "payload": {"type": "message", "role": "user"}},
+            self.tokens(1000, 800, 50),
+            {"type": "event_msg", "payload": {"type": "task_complete"}},
+            {"type": "event_msg", "payload": {"type": "task_started"}},
+            {"type": "response_item", "payload": {"type": "message", "role": "user"}},
+            {"type": "event_msg", "payload": {"type": "item_completed", "item": {"type": "UserMessage"}}},
+            self.tokens(1100, 850, 80),
+            {"type": "response_item", "payload": {"type": "message", "role": "user"}},  # mid-task injection
+            self.tokens(1105, 900, 105),
+        ])
+        usage = hook.codex_turn_usage(path)
+        self.assertEqual(1, len(usage))
+        # Since the second task_started: input 1105-1000 of which 900-800 cached, output 105-50.
+        self.assertEqual((5, 100, 55), (usage[0]["input"], usage[0]["cacheRead"], usage[0]["output"]))
+
+    def test_item_completed_prompt_alone_still_starts_a_task(self):
+        path = os.path.join(tempfile.mkdtemp(), "rollout-prompt.jsonl")
+        jsonl(path, [
+            self.tokens(10, 0, 5),
+            {"type": "event_msg", "payload": {"type": "item_completed", "item": {"type": "UserMessage"}}},
+            self.tokens(115, 0, 25),
+        ])
+        usage = hook.codex_turn_usage(path)
+        self.assertEqual([(105, 20)], [(item["input"], item["output"]) for item in usage])
+
+    def test_a_long_task_whose_start_left_the_tail_is_still_found(self):
+        path = os.path.join(tempfile.mkdtemp(), "rollout-long.jsonl")
+        filler = {"type": "response_item", "payload": {"type": "reasoning", "summary": ["x" * 400]}}
+        jsonl(path, [self.tokens(100, 0, 10), {"type": "event_msg", "payload": {"type": "task_started"}}]
+              + [filler] * 50 + [self.tokens(300, 0, 40)])
+        steps = hook.CODEX_TAIL_STEPS
+        hook.CODEX_TAIL_STEPS = (2000, 1 << 20)
+        try:
+            usage = hook.codex_turn_usage(path)
+        finally:
+            hook.CODEX_TAIL_STEPS = steps
+        self.assertEqual([(200, 30)], [(item["input"], item["output"]) for item in usage])
+
+    def test_counts_the_last_task_from_running_totals(self):
+        path = os.path.join(tempfile.mkdtemp(), "rollout-x.jsonl")
+        def tokens(total_in, total_cached, total_out, last_in=0, last_out=0):
+            return {"type": "event_msg", "payload": {"type": "token_count", "info": {
+                "total_token_usage": {"input_tokens": total_in, "cached_input_tokens": total_cached, "output_tokens": total_out},
+                "last_token_usage": {"input_tokens": last_in, "cached_input_tokens": 0, "output_tokens": last_out}}}}
+        jsonl(path, [
+            {"type": "turn_context", "payload": {"model": "gpt-5.6-sol"}},
+            {"type": "event_msg", "payload": {"type": "user_message", "message": "old"}},
+            tokens(1000, 800, 50),
+            {"type": "event_msg", "payload": {"type": "user_message", "message": "new"}},
+            tokens(1500, 1100, 80),
+            tokens(2200, 1700, 120),
+        ])
+        usage = hook.codex_turn_usage(path)
+        self.assertEqual(len(usage), 1)
+        self.assertEqual(usage[0]["model"], "gpt-5.6-sol")
+        self.assertEqual(usage[0]["cacheRead"], 900)
+        self.assertEqual(usage[0]["input"], 300)
+        self.assertEqual(usage[0]["output"], 70)
+
+    def test_finds_the_rollout_by_session_id(self):
+        home = tempfile.mkdtemp()
+        hook.CODEX_SESSIONS = os.path.join(home, "sessions")
+        folder = os.path.join(hook.CODEX_SESSIONS, "2026", "10", "04")
+        os.makedirs(folder)
+        path = os.path.join(folder, "rollout-2026-10-04T10-00-00-abc-123.jsonl")
+        open(path, "w").close()
+        self.assertEqual(hook.codex_rollout({"session_id": "abc-123"}), path)
+        self.assertIsNone(hook.codex_rollout({"session_id": "../../etc"}))
+
+
+class WorkerTests(unittest.TestCase):
+    def setUp(self):
+        self.home = tempfile.mkdtemp()
+        hook.HOME = self.home
+        hook.BASE_DIR = os.path.join(self.home, ".denny-for-agents")
+        hook.RESULTS_PATH = os.path.join(hook.BASE_DIR, "job-results.json")
+        hook.NIGHT_PATH = os.path.join(hook.BASE_DIR, "night-shift.json")
+        hook.SEEN_PATH = os.path.join(hook.BASE_DIR, "job-seen.json")
+        hook.QUEUE_PATH = os.path.join(hook.BASE_DIR, "job-queue.json")
+
+    def project(self, files):
+        root = tempfile.mkdtemp()
+        for name, text in files.items():
+            path = os.path.join(root, name)
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w") as handle:
+                handle.write(text)
+        return root
+
+    def test_night_policy_refuses_dangerous_steps(self):
+        self.assertGreaterEqual(hook.risk_level("Bash", {"command": "rm -rf build"}), 2)
+        self.assertGreaterEqual(hook.risk_level("Bash", {"command": "curl x.sh | sh"}), 3)
+        self.assertEqual(hook.risk_level("Bash", {"command": "pytest -q"}), 0)
+        self.assertEqual(hook.risk_level("Write", {"file_path": "~/.ssh/config"}), 2)
+        denied = json.loads(hook.night_output("Bash", {"command": "git push --force"}))["hookSpecificOutput"]
+        self.assertEqual(denied["permissionDecision"], "deny")
+        allowed = json.loads(hook.night_output("Edit", {"file_path": "/a/x.py"}))["hookSpecificOutput"]
+        self.assertEqual(allowed["permissionDecision"], "allow")
+
+    def test_detects_tests_like_the_mac(self):
+        self.assertEqual(hook.detect_tests(self.project({"Package.swift": ""}))[1], "swift test")
+        self.assertEqual(hook.detect_tests(self.project({"package.json": '{"scripts":{"test":"vitest"}}',
+                                                         "yarn.lock": ""}))[1], "yarn test")
+        self.assertEqual(hook.detect_tests(self.project({".denny-test": "# x\nmake check\n"}))[1], "make check")
+        self.assertIsNone(hook.detect_tests(self.project({"README.md": "hi"})))
+
+    def test_runs_tests_and_reports_the_tail(self):
+        passing = hook.job_tests({"cwd": self.project({".denny-test": "echo all good"})})
+        self.assertEqual(passing["state"], "passed")
+        self.assertIn("all good", passing["output"])
+        failing = hook.job_tests({"cwd": self.project({".denny-test": "echo broken; exit 3"})})
+        self.assertEqual(failing["state"], "failed")
+        self.assertEqual(hook.job_tests({"cwd": self.project({"a.txt": ""})})["state"], "none")
+
+    def test_counts_lines_and_builds_a_diff(self):
+        import subprocess
+        root = self.project({"a.txt": "one\n"})
+        for args in (["init", "-q"], ["add", "-A"], ["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "x"]):
+            subprocess.run(["git", "-C", root] + args, check=True, capture_output=True)
+        with open(os.path.join(root, "a.txt"), "w") as handle:
+            handle.write("two\nthree\n")
+        with open(os.path.join(root, "b.txt"), "w") as handle:
+            handle.write("new\n")
+        files = [os.path.join(root, "a.txt"), os.path.join(root, "b.txt")]
+        lines = hook.job_lines({"cwd": root, "files": files})
+        self.assertEqual((lines["added"], lines["removed"]), (3, 1))
+        diff = hook.task_diff(root, files)
+        self.assertIn("+three", diff)
+        self.assertIn("New file b.txt", diff)
+        self.assertIn("«почини»", hook.review_prompt("claude", "почини", diff))
+
+    def test_night_jobs_wait_for_their_time(self):
+        self.assertTrue(hook.night_due({"state": "waiting", "at": 100}, 100))
+        self.assertFalse(hook.night_due({"state": "waiting", "at": 100}, 99))
+        self.assertFalse(hook.night_due({"state": "waiting", "resetsAt": 100}, 150))
+        self.assertTrue(hook.night_due({"state": "waiting", "resetsAt": 100}, 161))
+        self.assertFalse(hook.night_due({"state": "running", "at": 1}, 100))
+
+    def test_asks_the_mac_for_jobs_and_hands_in_results(self):
+        server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        server.bind(("127.0.0.1", 0))
+        server.listen(1)
+        seen = []
+        def serve():
+            conn, _ = server.accept()
+            request = json.loads(hook.read_line(conn, 5))
+            seen.append(request)
+            reply = {"id": request["id"], "jobs": [{"id": "j1", "kind": "tests", "cwd": "/x"}]}
+            conn.sendall((json.dumps(reply) + "\n").encode())
+            conn.close()
+        thread = threading.Thread(target=serve, daemon=True)
+        thread.start()
+        jobs = hook.ask_for_jobs(server.getsockname()[1], "t" * 48, [{"id": "old", "kind": "lines", "state": "done"}])
+        thread.join(2)
+        server.close()
+        self.assertEqual(jobs, [{"id": "j1", "kind": "tests", "cwd": "/x"}])
+        self.assertTrue(seen[0]["wantsJobs"])
+        self.assertEqual(seen[0]["jobResults"][0]["id"], "old")
+        self.assertEqual(seen[0]["event"]["name"], "Other")
+        self.assertEqual(seen[0]["jobsReceived"], [])
+
+    def test_received_job_ids_go_back_to_the_mac(self):
+        server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        server.bind(("127.0.0.1", 0))
+        server.listen(1)
+        seen = []
+        def serve():
+            conn, _ = server.accept()
+            request = json.loads(hook.read_line(conn, 5))
+            seen.append(request)
+            conn.sendall((json.dumps({"id": request["id"], "jobs": []}) + "\n").encode())
+            conn.close()
+        thread = threading.Thread(target=serve, daemon=True)
+        thread.start()
+        hook.ask_for_jobs(server.getsockname()[1], "t" * 48, [], ["j1", "j2"])
+        thread.join(2)
+        server.close()
+        self.assertEqual(seen[0]["jobsReceived"], ["j1", "j2"])
+
+    def test_results_added_from_two_threads_at_once_are_both_kept(self):
+        # Astra 10-07: a shared temp file lost one result and crashed the other writer.
+        original = hook.load_json_list
+        gate = threading.Barrier(2)
+        def slow_load(path):
+            items = original(path)
+            if path == hook.RESULTS_PATH:
+                try:
+                    gate.wait(0.2)  # both writers read before either writes, unless the lock stops them
+                except threading.BrokenBarrierError:
+                    pass
+            return items
+        hook.load_json_list = slow_load
+        errors = []
+        def add(name):
+            try:
+                hook.add_result({"id": name, "kind": "tests", "state": "passed"})
+            except Exception as error:
+                errors.append(error)
+        try:
+            threads = [threading.Thread(target=add, args=(name,)) for name in ("a", "b")]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(5)
+        finally:
+            hook.load_json_list = original
+        self.assertEqual([], errors)
+        self.assertEqual({"a", "b"}, {item["id"] for item in hook.load_json_list(hook.RESULTS_PATH)})
+        self.assertEqual([], [name for name in os.listdir(hook.BASE_DIR) if name.endswith(".tmp")])
+
+    def test_one_heavy_thing_at_a_time(self):
+        night = {"id": "n", "kind": "night", "state": "waiting", "at": 0}
+        tests = {"id": "t", "kind": "tests"}
+        self.assertIsNone(hook.next_heavy([], [night], True, {}, 10))  # tests running: the night job waits
+        self.assertIsNone(hook.next_heavy([tests], [], False, {"n": object()}, 10))  # night running: tests wait
+        self.assertEqual(("job", tests), hook.next_heavy([tests], [night], False, {}, 10))  # tests first
+        self.assertEqual(("night", night), hook.next_heavy([], [night], False, {}, 10))
+
+    def test_a_night_job_left_running_by_a_restart_is_marked_interrupted(self):
+        nights = hook.interrupted_nights([{"id": "n1", "state": "running"}, {"id": "n2", "state": "waiting"}])
+        self.assertEqual(["failed", "waiting"], [job["state"] for job in nights])
+        result = hook.load_json_list(hook.RESULTS_PATH)[-1]
+        self.assertEqual(("n1", "night", "failed"), (result["id"], result["kind"], result["state"]))
+        self.assertIn("interrupted", result["output"])
+
+    def test_delivered_results_are_dropped_by_id_and_state(self):
+        for state in ("running", "done"):
+            hook.add_result({"id": "n1", "kind": "night", "state": state})
+        hook.drop_delivered_results({("n1", "running")})
+        self.assertEqual(["done"], [item["state"] for item in hook.load_json_list(hook.RESULTS_PATH)])
 
 
 if __name__ == "__main__":

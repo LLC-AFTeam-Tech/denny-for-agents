@@ -52,14 +52,20 @@ public struct UsageReport: Codable, Equatable, Sendable {
 
         public var length: TimeInterval { kind == "session" ? 5 * 3600 : 7 * 86400 }
 
-        /// What this reading means now: a passed reset is a renewed (0%) window;
-        /// a reading older than the window, with no reset time, is unknown.
+        /// How long after a reset "0%" is still believable without a fresh
+        /// reading. Past that the window is in use again and its real level is
+        /// unknown -- shown as "no fresh data", not a frozen 0%.
+        public static let renewedGrace: Double = 30 * 60
+
+        /// What this reading means now: a passed reset is a renewed (0%) window
+        /// for a while, then unknown; a reading older than the window, with no
+        /// reset time, is unknown.
         public func current(observedAt: Double, now: Double) -> Window {
             var window = self
             if let resetsAt, resetsAt <= now {
                 window.percent = 0
                 window.resetsAt = nil
-                window.stale = nil
+                window.stale = now - resetsAt > Self.renewedGrace ? true : nil
             } else if resetsAt == nil, now - observedAt > length {
                 window.stale = true
             }

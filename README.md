@@ -30,7 +30,7 @@ Every permission request is read before you see it. `rm -rf ~`, `curl … | sh`,
 Right before an agent runs `rm -rf`, `git reset --hard`, `git clean -f` or `git checkout -- .`, Denny snapshots your files — uncommitted and untracked ones included. Deleted the wrong folder? **Undo** in the notch puts everything back. In a git project the snapshot lives in a hidden ref and never touches your branch, index or stash; files outside git are copied aside. Snapshots are kept for 7 days by default — choose 1, 7 or 30 days and how much space copies may take. Claude Code's own rewind only covers its file edits — not what a shell command wiped out.
 
 ### 🌙 Night shift
-Your limit ran out at 11 pm and renews at 3 am? Queue the task — Denny starts the agent by himself the moment the limit renews (or at the time you pick) and keeps the Mac awake. Nobody approves at night, so he plays it safe: edits and safe commands go ahead, anything the guard calls dangerous is refused, the safety net snapshots as usual. In the morning a receipt is waiting, and Telegram has already told you it's done.
+Your limit ran out at 11 pm and renews at 3 am? Queue the task — on the Mac or on a server, where it runs even if your SSH session drops — and Denny starts the agent by himself the moment the limit renews (or at the time you pick) and keeps the Mac awake. Nobody approves at night, so he plays it safe: edits and safe commands go ahead, anything the guard calls dangerous is refused, the safety net snapshots as usual. In the morning a receipt is waiting, and Telegram tells you it's done. For a server job that message comes once the Mac is in touch with that server again: right away with Denny's own SSH connections, otherwise after the tunnel reconnects.
 
 ### 🔁 The relay
 Claude hit its plan limit in the middle of a task? Denny offers to hand the work to Codex — or the other way round — and writes the hand-off note for you: what was asked, which files were edited, which commands ran, and the last message. One click copies it, ⌘V continues the task.
@@ -45,7 +45,7 @@ Running the same command for the third time, editing the same file again and aga
 - ✅ **Allow / Deny / Ask there** right from the notch. If Denny isn't running, agents ask in the terminal as usual — he never blocks them.
 - 🎉 Denny peeks out with a laptop when a task starts and celebrates with a *Task Completed!* when it ends. In between he lives in the notch: looks around, crawls, hides, reacts.
 - 🧾 **Task receipt:** when a task ends — how long it took, files changed (+lines −lines), commands run, tokens and what they'd cost at API prices. One click copies it for a post.
-- ✅ **Is it really done?** Denny runs your project's tests right after the task (`swift test`, `npm test`, `cargo test`, `pytest`… or your own in `.denny-test`) and shows ✅ or ❌. Failed? One click copies the output for the agent to fix.
+- ✅ **Is it really done?** Denny runs your project's tests right after the task — on the Mac or on the server where the agent works — (`swift test`, `npm test`, `cargo test`, `pytest`… or your own in `.denny-test`) and shows ✅ or ❌. Failed? One click copies the output for the agent to fix.
 - 👀 **Cross-review:** one click and the other agent reviews what this one just changed — Codex checks Claude, Claude checks Codex — read-only, in the language of your task. Findings show up in the notch, ready to send back to the author.
 - 👆 Swipe two fingers on the open notch to flip between the overview and the stats.
 - ⏱️ A live number by the camera: the current task's timer while an agent works, your tightest limit at rest.
@@ -102,18 +102,76 @@ On first launch Denny offers to connect to your agents. He adds his hooks to `~/
 
 ### Agents on an SSH server
 
-1. Forward a port while you're connected. In Termius: **Port Forwarding → New → Remote**, remote port `47321`, bind address `127.0.0.1`, destination `127.0.0.1:47321`. With plain ssh:
+Claude Code or Codex run on a server (say, you work there through Termius or Terminal) and Denny runs on your Mac. Denny connects to the server over SSH himself and shows in the notch everything the agents do there.
+
+#### 1. An SSH key on the Mac (once)
+
+Denny connects the way you do from Terminal, but without a password — with a key. Check in **Terminal on the Mac** (not in Termius):
+
+```bash
+ssh user@server
+```
+
+Let in without a password — you have a key, go to step 2. Asked for a password (or you only use Termius) — create a key and send it to the server:
+
+```bash
+[ -f ~/.ssh/id_ed25519 ] || ssh-keygen -t ed25519 -N '' -f ~/.ssh/id_ed25519
+ssh-copy-id user@server
+```
+
+`ssh-copy-id` asks for the server password once. After that `ssh user@server` lets you in without one. A short name from `~/.ssh/config` works too.
+
+#### 2. Add the server
+
+**Settings → Servers → Denny's own connections** → enter `user@server` (or a name from `~/.ssh/config`) → **Add**.
+
+A dot appears next to it:
+
+| Dot | Meaning |
+|---|---|
+| 🟢 connected | all good |
+| 🟠 connecting… | give it a few seconds |
+| 🔴 with a note | something's in the way — see "If it won't connect" below; Denny keeps retrying |
+
+#### 3. Connect the agents (once per server)
+
+Press **Connect agents**. Denny puts his hook on the server (`~/.denny-for-agents/denny-hook.py`, needs only Python 3) and adds it to Claude Code's and Codex's settings — the old settings are kept next to them as a backup.
+
+Then **restart Claude Code / Codex on the server** — they only pick up new hooks at launch.
+
+Done: Allow / Deny requests, "the agent is writing code", receipts, limits and server load show up in the notch. Denny keeps the link alive himself: after the Mac sleeps, Wi-Fi changes or a VPN reconnects he connects again — no need to keep Termius open.
+
+After updating Denny, press **Connect agents** again to put the new hook version on the server.
+
+#### If it won't connect
+
+| Denny says | What to do |
+|---|---|
+| No SSH key for this server | Redo step 1. Denny shows the commands and a Copy commands button. |
+| Server unreachable | Check the address and the internet. If the server is only reachable over a VPN, turn it on. |
+| The server's key has changed | The server was reinstalled or replaced. If you're sure it's yours: `ssh-keygen -R server-address`, then `ssh user@server` and accept the new key. |
+| python3 isn't installed on the server | Install Python 3 there (e.g. `apt install python3`). |
+| Port is still busy on the server | Nothing to do: Denny takes the next port. Happens right after a dropped connection. |
+
+To check the hook on the server: `python3 ~/.denny-for-agents/denny-hook.py --ping`.
+
+To remove a server: 🗑 → Remove (the hook stays on the server) or Remove and disconnect agents on the server.
+
+#### By hand, without Denny's own connections
+
+If you'd rather keep the tunnel yourself (say, in Termius):
+
+1. Forward the port while connected. In Termius: **Port Forwarding → New → Remote**, server port `47321`, address `127.0.0.1`, destination `127.0.0.1:47321`. With plain ssh:
    ```bash
    ssh -R 47321:127.0.0.1:47321 you@server
    ```
-2. Put [`remote/denny-hook.py`](remote/denny-hook.py) into `~/.denny-for-agents/` on the server (Python 3, no dependencies).
-3. In **Settings → Servers** copy the install command, run it on the server, then check:
-   ```bash
-   python3 ~/.denny-for-agents/denny-hook.py --ping
-   ```
-4. Restart Claude Code / Codex on the server so they pick up the hooks.
+2. Put [`remote/denny-hook.py`](remote/denny-hook.py) on the server in `~/.denny-for-agents/`.
+3. In **Settings → Servers**, copy the install command, run it on the server and check with `--ping`.
+4. Restart Claude Code / Codex on the server.
 
-The forwarded port only listens on the server's `127.0.0.1`, and every request carries a secret token from your Mac.
+Note: such a tunnel drops when the Mac sleeps, the network changes or Termius closes — and doesn't come back by itself.
+
+Either way, the forwarded port listens only on `127.0.0.1` on the server, and every request carries a secret token from your Mac.
 
 ## How it works
 

@@ -11,6 +11,8 @@ final class AgentsController {
     private var store = AgentStore()
     private let server = AgentBridgeServer()
     private let collector = UsageCollector()
+    /// SSH connections Denny keeps itself (no Termius, reconnects on its own).
+    private(set) lazy var ssh = SSHTunnelManager(localSetup: { [weak self] in self?.remoteSetup })
     /// Latest report per machine: this Mac and every SSH server.
     private var reports: [String: UsageReport] = [:]
     /// Last time each SSH server reached Denny, by any event or report.
@@ -53,7 +55,8 @@ final class AgentsController {
 
     func start() {
         // A job "running" at launch was cut off by a restart or a crash.
-        for index in nightJobs.indices {
+        // A server keeps running its own jobs, so only this Mac's are affected.
+        for index in nightJobs.indices where nightJobs[index].host == nil {
             if case .running = nightJobs[index].state { nightJobs[index].state = .failed(at: Date(), reason: L.nightInterrupted) }
         }
         NightShift.save(nightJobs)
@@ -70,12 +73,16 @@ final class AgentsController {
         server.onFilesRequest = { [weak self] event in
             self?.deliverFiles(for: event) ?? []
         }
+        server.onJobsRequest = { [weak self] host, results, received in
+            self?.jobsRequested(host: host, results: results, received: received) ?? []
+        }
         server.onReport = { [weak self] report in
             self?.receive(report, from: report.host)
         }
         collector.onReport = { [weak self] report in
             self?.receive(report, from: "this-mac")
         }
+
         lidGuard.restoreIfNeeded()
         accessories.onHover = { [weak self] hovering in self?.handleHover(hovering) }
         collector.start()
@@ -84,6 +91,10 @@ final class AgentsController {
             DispatchQueue.main.async { self?.applySettings() }
         }
         model.serverRunning = server.start()
+        ssh.onReport = { [weak self] report in
+            self?.receive(report, from: report.host)
+        }
+        ssh.start()
         refreshHooksState()
         setUpPanel()
         timer = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in
@@ -163,6 +174,8 @@ final class AgentsController {
     }
 
     func stop() {
+        // ssh children would outlive the app and keep the old tunnels.
+        ssh.stopAll()
         accessories.hide()
         keepAwake.update(shouldHold: false)
         lidGuard.set(false)
@@ -227,6 +240,15 @@ final class AgentsController {
                 model.receipt = receipt
                 model.receiptTestCommand = nil
                 model.reviewer = nil
+                if let host = receipt.host, let cwd = receipt.cwd, !receipt.files.isEmpty {
+                    // The server's worker runs these there; it answers when it can.
+                    model.receiptTestCommand = L.testsOnServer(host)
+                    model.reviewer = CrossReview.reviewer(for: receipt.agent)
+                    let lines = RemoteJob(kind: .lines, cwd: cwd, files: receipt.files)
+                    remoteJobReceipts[lines.id] = receipt.id
+                    queue(lines, host: host, quietly: true)
+                    if settings.autoRunTests { runTests(for: receipt) }
+                }
                 if receipt.host == nil, let cwd = receipt.cwd, !receipt.files.isEmpty {
                     DispatchQueue.global(qos: .utility).async { [weak self] in
                         let found = TestRunner.detect(cwd: cwd)
@@ -310,9 +332,14 @@ final class AgentsController {
     }
 
     private func receive(_ report: UsageReport, from source: String) {
+        // The same server arrives by the port and over SSH: keep the newer.
+        if let current = reports[source], current.generatedAt > report.generatedAt { return }
         reports[source] = report
         if source != "this-mac" {
-            remoteSeen[report.host] = Date()
+            // When the server made it, not when it got here: an old report
+            // must read as "no contact for N min", not as live.
+            let made = min(Date(), Date(timeIntervalSince1970: report.generatedAt))
+            remoteSeen[report.host] = max(remoteSeen[report.host] ?? .distantPast, made)
             saveServerReports()
         }
         if source == "this-mac" {
@@ -551,8 +578,15 @@ final class AgentsController {
     /// Runs the project's tests in a login shell (so node, cargo and the
     /// like are on PATH), with CI=1 so watchers exit, for up to ten minutes.
     private func runTests(for receipt: TaskReceipt) {
-        guard receipt.host == nil, let cwd = receipt.cwd,
-              model.testRun.map({ $0.state != .running }) ?? true else { return }
+        guard let cwd = receipt.cwd, model.testRun.map({ $0.state != .running }) ?? true else { return }
+        if let host = receipt.host {
+            let job = RemoteJob(kind: .tests, cwd: cwd)
+            remoteJobReceipts[job.id] = receipt.id
+            model.testRun = TestRun(receiptId: receipt.id, command: host, startedAt: Date(), state: .running)
+            queue(job, host: host)
+            render()
+            return
+        }
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let found = TestRunner.detect(cwd: cwd) else { return }
             let started = Date()
@@ -617,13 +651,18 @@ final class AgentsController {
     /// The other agent reads the task's diff and lists problems, read-only,
     /// in a login shell so a node-based CLI finds node.
     private func runReview(of receipt: TaskReceipt) {
-        guard receipt.host == nil, let cwd = receipt.cwd,
-              model.review.map({ $0.state != .running }) ?? true else { return }
+        guard let cwd = receipt.cwd, model.review.map({ $0.state != .running }) ?? true else { return }
         let reviewer = CrossReview.reviewer(for: receipt.agent)
         let started = Date()
         model.review = ReviewRun(receiptId: receipt.id, author: receipt.agent, reviewer: reviewer, startedAt: started, state: .running)
         react(.think)
         render()
+        if let host = receipt.host {
+            let job = RemoteJob(kind: .review, cwd: cwd, files: receipt.files, author: receipt.agent, task: receipt.prompt)
+            remoteJobReceipts[job.id] = receipt.id
+            queue(job, host: host)
+            return
+        }
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             let state: ReviewRun.State
             if let binary = Self.binary(for: reviewer) {
@@ -692,18 +731,128 @@ final class AgentsController {
     func addNightJob(_ job: NightJob) {
         nightJobs.append(job)
         NightShift.save(nightJobs)
+        if let host = job.host { queue(RemoteJob(night: job), host: host) }
     }
 
     /// Cancels a waiting job, stops a running one, or forgets a finished one.
     func removeNightJob(id: String) {
-        if case .running? = nightJobs.first(where: { $0.id == id })?.state { nightProcess?.terminate() }
+        guard let job = nightJobs.first(where: { $0.id == id }) else { return }
+        switch job.state {
+        case .waiting, .running:
+            if let host = job.host {
+                queue(RemoteJob(kind: .cancel, target: id), host: host, quietly: true)
+            } else if case .running = job.state {
+                nightProcess?.terminate()
+            }
+        default:
+            break
+        }
         nightJobs.removeAll { $0.id == id }
         NightShift.save(nightJobs)
     }
 
-    /// Where the newest local session works: the default folder for a new job.
-    var recentLocalFolder: String? {
-        store.orderedSessions.first { $0.host == nil && $0.cwd != nil }?.cwd
+    /// Where the newest session on this Mac (nil) or a server works: the default folder for a new job.
+    func recentFolder(host: String?) -> String? {
+        store.orderedSessions.first { $0.host == host && $0.cwd != nil }?.cwd
+    }
+
+    /// Servers that sent events or reports, newest first.
+    var knownHosts: [String] {
+        remoteSeen.sorted { $0.value > $1.value }.map(\.key)
+    }
+
+    // MARK: - Server jobs
+
+    private static var serverJobsURL: URL { BridgePaths.directory().appendingPathComponent("server-jobs.json") }
+
+    /// Jobs not yet acknowledged by servers, their receipts and applied results:
+    /// saved on every change, so an app restart loses nothing.
+    private var serverJobs = JobOutbox.load(from: AgentsController.serverJobsURL) {
+        didSet { serverJobs.save(to: Self.serverJobsURL) }
+    }
+
+    /// Jobs wait here until that server's worker has stored them.
+    private var remoteJobs: [String: [RemoteJob]] {
+        get { serverJobs.waiting }
+        set { serverJobs.waiting = newValue }
+    }
+    private var workerSeen: [String: Date] = [:]
+    /// Job id -> the receipt it belongs to.
+    private var remoteJobReceipts: [String: String] {
+        get { serverJobs.receipts }
+        set { serverJobs.receipts = newValue }
+    }
+
+    private func queue(_ job: RemoteJob, host: String, quietly: Bool = false) {
+        remoteJobs[host, default: []].append(job)
+        if !quietly, Date().timeIntervalSince(workerSeen[host] ?? .distantPast) > 30 {
+            showDropMessage(DropMessage(title: L.serverJobWaits(host), warning: nil))
+        }
+    }
+
+    /// Main thread. A worker hands in results and the ids of jobs it has stored,
+    /// and gets every job of its server not acknowledged yet (see JobOutbox).
+    private func jobsRequested(host: String, results: [RemoteJobResult], received: [String]?) -> [RemoteJob] {
+        workerSeen[host] = Date()
+        remoteSeen[host] = Date()
+        // Worked on a copy and saved only if something changed: the worker asks every few seconds.
+        var outbox = serverJobs
+        let fresh = outbox.fresh(results)
+        let jobs = outbox.deliver(host: host, received: received)
+        if outbox != serverJobs { serverJobs = outbox }
+        for result in fresh { apply(result, host: host) }
+        if !fresh.isEmpty { render() }
+        return jobs
+    }
+
+    private func apply(_ result: RemoteJobResult, host: String) {
+        let receiptId = remoteJobReceipts[result.id]
+        switch result.kind {
+        case .tests:
+            guard let receiptId, model.testRun?.receiptId == receiptId, model.testRun?.state == .running else { return }
+            let state: TestRun.State
+            switch result.state {
+            case "passed": state = .passed
+            case "none": state = .unavailable(L.testsNoneOnServer)
+            default: state = .failed(output: result.output ?? "")
+            }
+            model.testRun = TestRun(receiptId: receiptId, command: result.command ?? host,
+                                    startedAt: model.testRun?.startedAt ?? Date(), state: state, duration: result.duration)
+            if state == .passed { react(.joy) } else if case .failed = state { react(.scared) }
+        case .review:
+            guard let receiptId, model.review?.receiptId == receiptId, model.review?.state == .running else { return }
+            if result.state == "done", let text = result.output {
+                let findings = CrossReview.findings(in: text)
+                model.review?.state = .done(text: text, findings: findings)
+                react(findings == 0 ? .joy : .idea)
+            } else {
+                model.review?.state = .failed(result.output ?? "—")
+            }
+        case .lines:
+            guard let receiptId, model.receipt?.id == receiptId, result.state == "done" else { return }
+            model.receipt?.added = result.added
+            model.receipt?.removed = result.removed
+        case .night:
+            guard let index = nightJobs.firstIndex(where: { $0.id == result.id }) else { return }
+            let job = nightJobs[index]
+            let place = (job.folder as NSString).lastPathComponent + " · " + host
+            switch result.state {
+            case "running":
+                nightJobs[index].state = .running(since: Date())
+                telegram.send("🌙 " + L.nightStarted(job.agent, place))
+            case "done":
+                nightJobs[index].state = .done(at: Date())
+                telegram.send("🌙 " + L.nightDone(job.agent, place))
+            case "failed":
+                nightJobs[index].state = .failed(at: Date(), reason: result.output ?? "—")
+                telegram.send("🌙 " + L.nightFailed(job.agent, place, result.output ?? "—"))
+            default:
+                break
+            }
+            NightShift.save(nightJobs)
+        case .cancel:
+            break
+        }
     }
 
     func renewTrigger(for agent: AgentKind) -> NightJob.Trigger {
@@ -712,7 +861,8 @@ final class AgentsController {
 
     private func startDueNightJob() {
         guard nightProcess == nil,
-              let index = nightJobs.firstIndex(where: { NightShift.isDue($0, limits: model.summary.limits[$0.agent]) }) else { return }
+              let index = nightJobs.firstIndex(where: { $0.host == nil && NightShift.isDue($0, limits: model.summary.limits[$0.agent]) })
+        else { return }
         let job = nightJobs[index]
         guard let binary = Self.binary(for: job.agent), FileManager.default.fileExists(atPath: job.folder) else {
             finishNightJob(id: job.id, state: .failed(at: Date(), reason: L.reviewNotFound))

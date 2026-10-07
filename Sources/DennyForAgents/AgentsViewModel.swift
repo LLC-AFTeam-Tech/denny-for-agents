@@ -48,6 +48,8 @@ struct TestRun: Equatable {
         case running
         case passed
         case failed(output: String)
+        /// Nothing to run (e.g. no tests found on the server).
+        case unavailable(String)
     }
 
     let receiptId: String
@@ -462,6 +464,12 @@ struct L {
     static var testsAutoSetting: String { t("tests.autoSetting") }
     static var testsAutoFooter: String { t("tests.autoFooter") }
     static var testsTimedOut: String { t("tests.timedOut") }
+    static func testsOnServer(_ host: String) -> String { t("tests.onServer", host) }
+    static var testsNoneOnServer: String { t("tests.noneOnServer") }
+    static func serverJobWaits(_ host: String) -> String { t("server.jobWaits", host) }
+    static var nightWhere: String { t("night.where") }
+    static var nightThisMac: String { t("night.thisMac") }
+    static var nightServerFolder: String { t("night.serverFolder") }
     static func reviewButton(_ agent: AgentKind) -> String { t("review.button", agent.shortName) }
     static func reviewRunning(_ agent: AgentKind, _ time: String) -> String { t("review.running", agent.shortName, time) }
     static func reviewClean(_ agent: AgentKind) -> String { t("review.clean", agent.shortName) }
@@ -482,6 +490,31 @@ struct L {
     static var serversConnected: String { t("settings.serversConnected") }
     static var noServers: String { t("settings.noServers") }
     static func lastSeen(_ when: String) -> String { t("settings.lastSeen", when) }
+    static func noContact(_ when: String) -> String { t("settings.noContact", when) }
+    static var sshTitle: String { t("ssh.title") }
+    static var sshBody: String { t("ssh.body") }
+    static var sshPlaceholder: String { t("ssh.placeholder") }
+    static var sshAdd: String { t("ssh.add") }
+    static var sshInvalid: String { t("ssh.invalid") }
+    static var sshConnecting: String { t("ssh.connecting") }
+    static var sshConnectAgents: String { t("ssh.connectAgents") }
+    static var sshConnectAgentsHelp: String { t("ssh.connectAgentsHelp") }
+    static var sshInstalling: String { t("ssh.installing") }
+    static var sshAgentsConnected: String { t("ssh.agentsConnected") }
+    static var sshNeedsKey: String { t("ssh.needsKey") }
+    static var sshKeyHint: String { t("ssh.keyHint") }
+    static var sshCopyCommands: String { t("ssh.copyCommands") }
+    static var sshHostKeyChanged: String { t("ssh.hostKeyChanged") }
+    static var sshUnreachable: String { t("ssh.unreachable") }
+    static var sshPortBusy: String { t("ssh.portBusy") }
+    static var sshNoPython: String { t("ssh.noPython") }
+    static var sshDropped: String { t("ssh.dropped") }
+    static var sshRemove: String { t("ssh.remove") }
+    static var sshRemoveAndUnhook: String { t("ssh.removeAndUnhook") }
+    static var sshRemoveQuestion: String { t("ssh.removeQuestion") }
+    static func sshConnected(_ value: String) -> String { t("ssh.connected", value) }
+    static func sshRetry(_ value: String) -> String { t("ssh.retry", value) }
+    static func sshInstallFailed(_ value: String) -> String { t("ssh.installFailed", value) }
     static var peeksTitle: String { t("settings.peeks") }
     static var peekOnStart: String { t("settings.peekOnStart") }
     static var peekOnWriting: String { t("settings.peekOnWriting") }

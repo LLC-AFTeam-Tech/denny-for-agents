@@ -35,6 +35,23 @@ final class SettingsModel: ObservableObject {
 
     @Published var installed: [AgentKind: Bool] = [:]
     @Published var hosts: [Host] = []
+
+    struct SSHRow: Identifiable, Equatable {
+        enum Mood: Equatable { case ok, waiting, problem }
+        let id: String
+        let destination: String
+        let status: String
+        let mood: Mood
+        let needsKey: Bool
+    }
+
+    @Published var sshRows: [SSHRow] = []
+    var sshSource: () -> [SSHRow] = { [] }
+    var addSSH: (String) -> Bool = { _ in false }
+    var removeSSH: (_ id: String, _ uninstallHooks: Bool) -> Void = { _, _ in }
+    /// `done(nil)` when the hook is on the server, else what went wrong.
+    var installSSH: (_ id: String, _ done: @escaping (String?) -> Void) -> Void = { _, done in done(nil) }
+    /// False when the link isn't a valid https URL or the token is empty.
     @Published var alerts: AlertSettings {
         didSet { notifier.settings = alerts }
     }
@@ -57,7 +74,8 @@ final class SettingsModel: ObservableObject {
     var nightJobs: () -> [NightJob] = { [] }
     var addNightJob: (NightJob) -> Void = { _ in }
     var removeNightJob: (String) -> Void = { _ in }
-    var recentFolder: () -> String? = { nil }
+    var recentFolder: (String?) -> String? = { _ in nil }
+    var knownHosts: () -> [String] = { [] }
     var renewTrigger: (AgentKind) -> NightJob.Trigger = { _ in .limitRenews(resetsAt: nil) }
     /// Read by the hooks from ~/.denny-for-agents/safety-net/settings.json.
     @Published var safetySettings = SafetyNetSettings.load() {
@@ -121,6 +139,7 @@ final class SettingsModel: ObservableObject {
         installed = Dictionary(uniqueKeysWithValues: AgentKind.allCases.map { ($0, HookInstaller.isInstalled(agent: $0)) })
         lidRuleInstalled = lidGuard.isInstalled
         hosts = remoteHosts().map { Host(name: $0.name, lastSeen: $0.lastSeen) }
+        sshRows = sshSource()
         mac = systemStats.sample()
         servers = serverLoads().map { ServerLoad(host: $0.host, system: $0.system, at: $0.at) }
     }
@@ -140,11 +159,21 @@ final class SettingsModel: ObservableObject {
 }
 
 struct SettingsView: View {
+    /// A server quiet for longer than this is shown as "no contact".
+    static let silentAfter: TimeInterval = 10 * 60
+
     @ObservedObject var model: SettingsModel
     @ObservedObject var settings = AppSettings.shared
     @ObservedObject var telegram = TelegramBridge.shared
     @State private var botToken = ""
+    @State private var sshDestination = ""
+    @State private var sshInvalid = false
+    @State private var sshMessages: [String: String] = [:]
+    @State private var sshInstalling: Set<String> = []
+    @State private var sshRemoving: SettingsModel.SSHRow?
     @State private var nightAgent: AgentKind = .claude
+    /// "" is this Mac, otherwise a server's name.
+    @State private var nightHost = ""
     @State private var nightFolder = ""
     @State private var nightPrompt = ""
     @State private var nightAtTime = false
@@ -311,18 +340,104 @@ struct SettingsView: View {
         }
     }
 
+    @ViewBuilder private var sshConnections: some View {
+        PanelCard {
+            Text(L.sshBody).font(.caption).foregroundColor(.secondary)
+            ForEach(model.sshRows) { row in
+                VStack(alignment: .leading, spacing: 4) {
+                    HStack(alignment: .top) {
+                        Circle()
+                            .fill(row.mood == .ok ? Color.green : (row.mood == .waiting ? Color.orange : Color.red))
+                            .frame(width: 8, height: 8)
+                            .padding(.top, 5)
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(row.destination).lineLimit(1).truncationMode(.middle)
+                            Text(row.status).font(.caption)
+                                .foregroundColor(row.mood == .problem ? .red : .secondary)
+                        }
+                        Spacer()
+                        Button(sshInstalling.contains(row.id) ? L.sshInstalling : L.sshConnectAgents) {
+                            sshInstalling.insert(row.id)
+                            sshMessages[row.id] = nil
+                            model.installSSH(row.id) { error in
+                                sshInstalling.remove(row.id)
+                                sshMessages[row.id] = error ?? L.sshAgentsConnected
+                            }
+                        }
+                        .disabled(row.mood != .ok || sshInstalling.contains(row.id))
+                        .help(L.sshConnectAgentsHelp)
+                        Button { sshRemoving = row } label: { Image(systemName: "trash") }
+                            .buttonStyle(.borderless)
+                            .help(L.sshRemove)
+                    }
+                    if let message = sshMessages[row.id] {
+                        Text(message).font(.caption)
+                            .foregroundColor(message == L.sshAgentsConnected ? .green : .red)
+                    }
+                    if row.needsKey {
+                        Text(L.sshKeyHint).font(.caption).foregroundColor(.secondary)
+                        Text(SSHLink.keySetupCommands(destination: row.destination))
+                            .font(.system(size: 11, design: .monospaced))
+                            .textSelection(.enabled)
+                        HStack {
+                            Spacer()
+                            Button(L.sshCopyCommands) {
+                                NSPasteboard.general.clearContents()
+                                NSPasteboard.general.setString(SSHLink.keySetupCommands(destination: row.destination), forType: .string)
+                            }
+                        }
+                    }
+                }
+            }
+            HStack {
+                TextField(L.sshPlaceholder, text: $sshDestination)
+                    .textFieldStyle(.roundedBorder)
+                    .onSubmit(addSSH)
+                Button(L.sshAdd, action: addSSH)
+                    .disabled(sshDestination.trimmingCharacters(in: .whitespaces).isEmpty)
+            }
+            if sshInvalid {
+                Text(L.sshInvalid).font(.caption).foregroundColor(.red)
+            }
+        } header: {
+            Text(L.sshTitle)
+        }
+        .confirmationDialog(L.sshRemoveQuestion, isPresented: Binding(
+            get: { sshRemoving != nil }, set: { if !$0 { sshRemoving = nil } }
+        ), presenting: sshRemoving) { row in
+            Button(L.sshRemoveAndUnhook, role: .destructive) {
+                model.removeSSH(row.id, true)
+                model.refresh()
+            }
+            Button(L.sshRemove) {
+                model.removeSSH(row.id, false)
+                model.refresh()
+            }
+        }
+    }
+
+    private func addSSH() {
+        sshInvalid = !model.addSSH(sshDestination)
+        if !sshInvalid { sshDestination = "" }
+        model.refresh()
+    }
+
     @ViewBuilder private var servers: some View {
+        sshConnections
         PanelCard(L.serversConnected) {
             if model.hosts.isEmpty {
                 Text(L.noServers).foregroundColor(.secondary)
             } else {
                 ForEach(model.hosts) { host in
+                    // Listed means "known", not "connected": say when it was last heard from.
+                    let silent = Date().timeIntervalSince(host.lastSeen) > Self.silentAfter
                     HStack {
                         Image(systemName: "server.rack")
                         Text(host.name)
                         Spacer()
-                        Text(L.lastSeen(Fmt.relative(host.lastSeen, now: Date())))
-                            .foregroundColor(.secondary)
+                        Text(silent ? L.noContact(Fmt.relative(host.lastSeen, now: Date()))
+                                    : L.lastSeen(Fmt.relative(host.lastSeen, now: Date())))
+                            .foregroundColor(silent ? .orange : .secondary)
                     }
                 }
             }
@@ -607,13 +722,28 @@ struct SettingsView: View {
             Picker(L.nightAgent, selection: $nightAgent) {
                 ForEach(AgentKind.allCases, id: \.self) { agent in Text(agent.displayName).tag(agent) }
             }
-            HStack {
-                Text(nightFolder.isEmpty ? L.nightNoFolder : (nightFolder as NSString).abbreviatingWithTildeInPath)
+            let hosts = model.knownHosts()
+            if !hosts.isEmpty {
+                Picker(L.nightWhere, selection: $nightHost) {
+                    Text(L.nightThisMac).tag("")
+                    ForEach(hosts, id: \.self) { host in Text(host).tag(host) }
+                }
+                .onChange(of: nightHost) { host in
+                    nightFolder = model.recentFolder(host.isEmpty ? nil : host) ?? ""
+                }
+            }
+            if nightHost.isEmpty {
+                HStack {
+                    Text(nightFolder.isEmpty ? L.nightNoFolder : (nightFolder as NSString).abbreviatingWithTildeInPath)
+                        .font(.system(size: 11, design: .monospaced))
+                        .lineLimit(1)
+                        .truncationMode(.head)
+                    Spacer()
+                    Button(L.nightChooseFolder) { chooseNightFolder() }
+                }
+            } else {
+                TextField(L.nightServerFolder, text: $nightFolder)
                     .font(.system(size: 11, design: .monospaced))
-                    .lineLimit(1)
-                    .truncationMode(.head)
-                Spacer()
-                Button(L.nightChooseFolder) { chooseNightFolder() }
             }
             TextEditor(text: $nightPrompt)
                 .font(.system(size: 12))
@@ -630,7 +760,7 @@ struct SettingsView: View {
             Button(L.nightQueue) { queueNightJob() }
                 .disabled(nightFolder.isEmpty || nightPrompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
         }
-        .onAppear { if nightFolder.isEmpty { nightFolder = model.recentFolder() ?? "" } }
+        .onAppear { if nightFolder.isEmpty { nightFolder = model.recentFolder(nil) ?? "" } }
         let jobs = model.nightJobs()
         if !jobs.isEmpty {
             PanelCard(L.nightQueueTitle) {
@@ -638,7 +768,8 @@ struct SettingsView: View {
                     HStack(alignment: .top, spacing: 8) {
                         VStack(alignment: .leading, spacing: 2) {
                             Text(job.prompt).font(.system(size: 12)).lineLimit(2)
-                            Text("\(job.agent.shortName) · \((job.folder as NSString).lastPathComponent) · \(nightStatus(job))")
+                            Text(([job.agent.shortName, (job.folder as NSString).lastPathComponent] + (job.host.map { [$0] } ?? [])
+                                  + [nightStatus(job)]).joined(separator: " · "))
                                 .font(.caption)
                                 .foregroundColor(.secondary)
                         }
@@ -689,8 +820,9 @@ struct SettingsView: View {
             if date < Date() { date = date.addingTimeInterval(86400) }
             trigger = .at(date)
         }
-        model.addNightJob(NightJob(agent: nightAgent, folder: nightFolder,
-                                   prompt: nightPrompt.trimmingCharacters(in: .whitespacesAndNewlines), trigger: trigger))
+        model.addNightJob(NightJob(agent: nightAgent, folder: nightFolder.trimmingCharacters(in: .whitespaces),
+                                   prompt: nightPrompt.trimmingCharacters(in: .whitespacesAndNewlines), trigger: trigger,
+                                   host: nightHost.isEmpty ? nil : nightHost))
         nightPrompt = ""
         model.objectWillChange.send()
     }

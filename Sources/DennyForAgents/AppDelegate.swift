@@ -29,12 +29,38 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         setUpStatusItem()
         controller.onOpenSettings = { [weak self] in self?.openSettings() }
         settingsModel.serverLoads = { [weak self] in self?.controller.serverLoads ?? [] }
+        settingsModel.sshSource = { [weak self] in
+            guard let manager = self?.controller.ssh else { return [] }
+            return manager.servers.map { server in
+                switch manager.states[server.id] {
+                case .connected(_, let since)?:
+                    return .init(id: server.id, destination: server.destination,
+                                 status: L.sshConnected(Fmt.relative(since, now: Date())), mood: .ok, needsKey: false)
+                case .failed(let failure, let retryAt)?:
+                    let wait = Fmt.countdown(max(0, retryAt.timeIntervalSinceNow))
+                    return .init(id: server.id, destination: server.destination,
+                                 status: SSHTunnelManager.describe(failure) + " · " + L.sshRetry(wait),
+                                 mood: .problem, needsKey: failure == .needsKey)
+                case .connecting?, nil:
+                    return .init(id: server.id, destination: server.destination,
+                                 status: L.sshConnecting, mood: .waiting, needsKey: false)
+                }
+            }
+        }
+        settingsModel.addSSH = { [weak self] destination in self?.controller.ssh.add(destination: destination) ?? false }
+        settingsModel.removeSSH = { [weak self] id, unhook in self?.controller.ssh.remove(id: id, uninstallHooks: unhook) }
+        settingsModel.installSSH = { [weak self] id, done in
+            guard let self else { return done(nil) }
+            self.controller.ssh.installHooks(id: id, done: done)
+        }
+        controller.ssh.onChange = { [weak self] in self?.settingsModel.refresh() }
         settingsModel.safetySnapshots = { [weak self] in self?.controller.safetySnapshots ?? [] }
         settingsModel.undoSnapshot = { [weak self] notice in self?.controller.undo(notice) }
         settingsModel.nightJobs = { [weak self] in self?.controller.nightJobs ?? [] }
         settingsModel.addNightJob = { [weak self] job in self?.controller.addNightJob(job) }
         settingsModel.removeNightJob = { [weak self] id in self?.controller.removeNightJob(id: id) }
-        settingsModel.recentFolder = { [weak self] in self?.controller.recentLocalFolder }
+        settingsModel.recentFolder = { [weak self] host in self?.controller.recentFolder(host: host) }
+        settingsModel.knownHosts = { [weak self] in self?.controller.knownHosts ?? [] }
         settingsModel.renewTrigger = { [weak self] agent in self?.controller.renewTrigger(for: agent) ?? .limitRenews(resetsAt: nil) }
         settingsModel.clearSnapshots = { [weak self] in
             self?.controller.clearSnapshots()

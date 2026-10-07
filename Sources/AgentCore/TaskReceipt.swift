@@ -97,6 +97,108 @@ public enum TurnUsage {
         }
     }
 
+    /// The Codex session log: the hook's transcript_path, else found by session id
+    /// under ~/.codex/sessions/YYYY/MM/DD (recent days first).
+    public static func codexRollout(payload data: Data, home: URL = FileManager.default.homeDirectoryForCurrentUser) -> String? {
+        guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
+        if let path = json["transcript_path"] as? String, FileManager.default.fileExists(atPath: path) { return path }
+        guard let session = json["session_id"] as? String, !session.isEmpty, !session.contains("/") else { return nil }
+        let sessions = home.appendingPathComponent(".codex/sessions")
+        let suffix = "-\(session).jsonl"
+        let calendar = Calendar(identifier: .gregorian)
+        for daysAgo in 0..<3 {
+            let day = calendar.dateComponents([.year, .month, .day], from: Date().addingTimeInterval(-Double(daysAgo) * 86400))
+            let folder = sessions.appendingPathComponent(String(format: "%04d/%02d/%02d", day.year ?? 0, day.month ?? 0, day.day ?? 0))
+            if let name = (try? FileManager.default.contentsOfDirectory(atPath: folder.path))?.first(where: { $0.hasSuffix(suffix) }) {
+                return folder.appendingPathComponent(name).path
+            }
+        }
+        guard let walker = FileManager.default.enumerator(atPath: sessions.path) else { return nil }
+        for case let name as String in walker where name.hasSuffix(suffix) {
+            return sessions.appendingPathComponent(name).path
+        }
+        return nil
+    }
+
+    /// Where a Codex task starts. Codex marks tasks itself (task_started); the
+    /// prompt is only a fallback and has been written three ways: event_msg
+    /// user_message (old), response_item message role=user and event_msg
+    /// item_completed with a UserMessage item (current). Mirrors codex_boundary.
+    enum CodexBoundary { case task, prompt }
+
+    static func codexBoundary(_ entry: [String: Any], _ payload: [String: Any]) -> CodexBoundary? {
+        let kind = entry["type"] as? String, item = payload["type"] as? String
+        if kind == "event_msg", item == "task_started" || item == "turn_started" { return .task }
+        if kind == "event_msg", item == "user_message" { return .prompt }
+        if kind == "response_item", item == "message", payload["role"] as? String == "user" { return .prompt }
+        if kind == "event_msg", item == "item_completed",
+           (payload["item"] as? [String: Any])?["type"] as? String == "UserMessage" { return .prompt }
+        return nil
+    }
+
+    /// A long task can push its start out of the usual tail: look further back
+    /// before giving up. Mirrors CODEX_TAIL_STEPS.
+    public static let codexTailSteps: [Int] = [tailBytes, 64 << 20, 512 << 20]
+
+    /// Tokens of the last task in a Codex rollout: the running totals after its
+    /// start minus the totals before it. Mirrors codex_turn_usage in denny-hook.py.
+    public static func codex(rollout path: String, tailSteps: [Int] = codexTailSteps) -> [UsageReport.Item] {
+        guard let handle = FileHandle(forReadingAtPath: path) else { return [] }
+        defer { try? handle.close() }
+        let size = handle.seekToEndOfFile()
+        for step in tailSteps {
+            let start = size > UInt64(step) ? size - UInt64(step) : 0
+            handle.seek(toFileOffset: start)
+            var lines = handle.readDataToEndOfFile().split(separator: 0x0A)
+            if start > 0, !lines.isEmpty { lines.removeFirst() }
+            let (seen, usage) = codexUsage(lines)
+            if seen || start == 0 { return usage }
+        }
+        return []
+    }
+
+    static func codexUsage(_ lines: [Data.SubSequence]) -> (seen: Bool, usage: [UsageReport.Item]) {
+        func reading(_ usage: Any?) -> [Int] {
+            let usage = usage as? [String: Any] ?? [:]
+            return [int(usage["input_tokens"]), int(usage["cached_input_tokens"]), int(usage["output_tokens"]),
+                    int(usage["cache_write_input_tokens"])]
+        }
+        var model = "codex", base = [0, 0, 0, 0], last: [Int]?, summed = [0, 0, 0, 0]
+        var seen = false, tasksMarked = false
+        for line in lines {
+            guard let entry = try? JSONSerialization.jsonObject(with: Data(line)) as? [String: Any],
+                  let payload = entry["payload"] as? [String: Any] else { continue }
+            let type = entry["type"] as? String
+            if type == "turn_context", let name = payload["model"] as? String {
+                model = name
+                continue
+            }
+            let boundary = codexBoundary(entry, payload)
+            // With task markers present, a prompt is part of the task: one
+            // message written in two formats mustn't restart the count.
+            if boundary == .task || (boundary == .prompt && !tasksMarked) {
+                tasksMarked = tasksMarked || boundary == .task
+                base = last ?? [0, 0, 0, 0]
+                summed = [0, 0, 0, 0]
+                seen = true
+            } else if type == "event_msg", payload["type"] as? String == "token_count",
+                      let info = payload["info"] as? [String: Any] {
+                if info["total_token_usage"] is [String: Any] { last = reading(info["total_token_usage"]) }
+                if seen, info["last_token_usage"] is [String: Any] {
+                    summed = zip(summed, reading(info["last_token_usage"])).map { $0 + $1 }
+                }
+            }
+        }
+        guard seen, let last else { return (seen, []) }
+        var delta = zip(last, base).map { $0 - $1 }
+        if delta.contains(where: { $0 < 0 }) { delta = summed }  // totals restarted after a compaction
+        guard delta.contains(where: { $0 > 0 }) else { return (seen, []) }
+        let cached = min(delta[1], delta[0])
+        // OpenAI counts cached tokens inside input_tokens.
+        return (seen, [UsageReport.Item(hour: 0, agent: .codex, model: model, input: delta[0] - cached,
+                                        cacheWrite5m: delta[3], cacheRead: cached, output: delta[2])])
+    }
+
     /// A line the user typed (not a tool result or a meta line).
     static func isPrompt(_ entry: [String: Any]) -> Bool {
         guard entry["type"] as? String == "user", entry["isMeta"] as? Bool != true,

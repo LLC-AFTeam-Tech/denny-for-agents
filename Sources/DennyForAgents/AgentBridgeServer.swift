@@ -8,6 +8,8 @@ final class AgentBridgeServer {
     var onReport: ((UsageReport) -> Void)?
     /// Files waiting for the server that sent this event.
     var onFilesRequest: ((HookEvent) -> [FileOutbox.Item])?
+    /// A server worker asks for jobs (and hands in results).
+    var onJobsRequest: ((String, [RemoteJobResult], [String]?) -> [RemoteJob])?
 
     private var listener: UnixSocket?
     private var remoteListener: UnixSocket?
@@ -75,6 +77,17 @@ final class AgentBridgeServer {
         guard let line = client.readLine(),
               let request = try? BridgeCodec.decode(BridgeRequest.self, line: line) else { return }
         if let requiredToken, !RemoteBridge.tokensMatch(request.token, requiredToken) { return }
+        if request.wantsJobs == true {
+            let host = request.event.host ?? "server"
+            let jobs: [RemoteJob] = DispatchQueue.main.sync {
+                guard !self.stopped else { return [] }
+                return self.onJobsRequest?(host, request.jobResults ?? [], request.jobsReceived) ?? []
+            }
+            if let line = try? BridgeCodec.encodeLine(JobBatch(id: request.id, jobs: jobs)) {
+                client.write(line)
+            }
+            return
+        }
         if request.wantsFiles == true {
             let items: [FileOutbox.Item] = DispatchQueue.main.sync {
                 guard !self.stopped else { return [] }

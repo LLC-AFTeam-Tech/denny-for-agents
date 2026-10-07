@@ -16,6 +16,8 @@ hook exits 0 with no output and the agent carries on as if it weren't there.
   python3 denny-hook.py --snapshots     # safety net: snapshots taken before risky commands
   python3 denny-hook.py --restore ID    # put the files of a snapshot back
   python3 denny-hook.py --clear-snapshots
+  python3 denny-hook.py --worker        # runs tests, reviews and night jobs sent from the Mac
+  python3 denny-hook.py --set-port PORT # the tunnel Denny keeps itself landed on another port
   python3 denny-hook.py claude|codex    # called by the agent itself
 """
 
@@ -30,6 +32,8 @@ import shutil
 import socket
 import subprocess
 import sys
+import tempfile
+import threading
 import time
 import uuid
 
@@ -63,6 +67,20 @@ STATUSLINE_ORIGINAL = os.path.join(BASE_DIR, "statusline-original.json")
 LOCK_PATH = os.path.join(BASE_DIR, "usage-state.lock")
 REPORT_STAMP = os.path.join(BASE_DIR, "report-sent")
 REPORT_INTERVAL_SECONDS = 60
+WORKER_LOCK = os.path.join(BASE_DIR, "worker.lock")
+ACTIVITY_STAMP = os.path.join(BASE_DIR, "activity")
+NIGHT_PATH = os.path.join(BASE_DIR, "night-shift.json")
+RESULTS_PATH = os.path.join(BASE_DIR, "job-results.json")
+# Jobs taken from the Mac: ids already stored (a resent job is recognised and
+# only acknowledged again), and tests/reviews not yet run (survive a restart).
+SEEN_PATH = os.path.join(BASE_DIR, "job-seen.json")
+QUEUE_PATH = os.path.join(BASE_DIR, "job-queue.json")
+SEEN_KEEP = 500
+WORKER_IDLE_SECONDS = 2 * 3600
+TEST_TIMEOUT_SECONDS = 10 * 60
+REVIEW_TIMEOUT_SECONDS = 10 * 60
+NIGHT_TIMEOUT_SECONDS = 3 * 3600
+NIGHT_ENV = "DENNY_NIGHT_SHIFT"
 SAFETY_DIR = os.path.join(BASE_DIR, "safety-net")
 SAFETY_INDEX = os.path.join(SAFETY_DIR, "index.json")
 SAFETY_REF = "refs/denny/safety-net/"
@@ -266,6 +284,21 @@ def run_hook(agent):
     event = build_event(payload, agent)
     if event is None:
         return
+    try:
+        with open(ACTIVITY_STAMP, "w"):
+            pass
+    except OSError:
+        pass
+    night = os.environ.get(NIGHT_ENV)
+    if night:
+        event["nightShift"] = night
+        if agent == "claude" and event["name"] == "PreToolUse":
+            output = night_output(payload.get("tool_name"), payload.get("tool_input"))
+            if output:
+                sys.stdout.write(output + "\n")
+                sys.stdout.flush()
+    if event["name"] in ("SessionStart", "UserPromptSubmit", "Stop"):
+        start_worker()
     if event["name"] in ("UserPromptSubmit", "SessionStart"):
         written = receive_files(event, config[0], config[1])
         if written and agent == "claude" and event["name"] == "UserPromptSubmit":
@@ -282,9 +315,10 @@ def run_hook(agent):
                 event["snapshot"] = snapshot
         except Exception:
             pass
-    if event["name"] == "Stop" and agent == "claude":
+    if event["name"] == "Stop":
         try:
-            usage = turn_usage(payload.get("transcript_path"))
+            usage = turn_usage(payload.get("transcript_path")) if agent == "claude" \
+                else codex_turn_usage(codex_rollout(payload))
             if usage:
                 event["turnUsage"] = usage
         except Exception:
@@ -303,6 +337,7 @@ def run_hook(agent):
 # ---------------------------------------------------------------- task receipt
 
 TURN_TAIL_BYTES = 8 << 20
+CODEX_SESSIONS = os.path.join(HOME, ".codex", "sessions")
 
 
 def is_prompt(entry):
@@ -375,6 +410,114 @@ def turn_usage(path):
     return [{"hour": 0, "agent": "claude", "model": model, "input": v[0], "cacheWrite5m": v[1],
              "cacheWrite1h": v[2], "cacheRead": v[3], "output": v[4]}
             for model, v in ((model, by_model[model]) for model in models)]
+
+
+def read_tail(path, size=None):
+    size = size or TURN_TAIL_BYTES
+    with open(path, "rb") as handle:
+        handle.seek(0, os.SEEK_END)
+        total = handle.tell()
+        start = max(0, total - size)
+        handle.seek(start)
+        lines = handle.read().split(b"\n")
+    return lines[1:] if start > 0 and lines else lines
+
+
+def codex_rollout(payload):
+    """The Codex session log: the path the hook was given, else found by session id."""
+    path = payload.get("transcript_path")
+    if isinstance(path, str) and os.path.exists(path):
+        return path
+    session = payload.get("session_id")
+    if not isinstance(session, str) or not session or "/" in session:
+        return None
+    matches = glob.glob(os.path.join(CODEX_SESSIONS, "*", "*", "*", "rollout-*%s.jsonl" % session))
+    return max(matches, key=os.path.getmtime) if matches else None
+
+
+# Where a Codex task starts. Codex marks tasks itself (task_started); the
+# prompt is only a fallback, and it has been written three ways over time:
+# event_msg user_message (old), response_item message role=user and
+# event_msg item_completed with a UserMessage item (current).
+def codex_boundary(entry, payload):
+    kind, item = entry.get("type"), payload.get("type")
+    if kind == "event_msg" and item in ("task_started", "turn_started"):
+        return "task"
+    if kind == "event_msg" and item == "user_message":
+        return "prompt"
+    if kind == "response_item" and item == "message" and payload.get("role") == "user":
+        return "prompt"
+    if kind == "event_msg" and item == "item_completed" and isinstance(payload.get("item"), dict) \
+            and payload["item"].get("type") == "UserMessage":
+        return "prompt"
+    return None
+
+
+def codex_usage_in(lines):
+    """(found a start, usage of the last task) for these rollout lines."""
+    model, base, last, summed = "codex", [0, 0, 0, 0], None, [0, 0, 0, 0]
+    seen, tasks_marked = False, False
+    for line in lines:
+        try:
+            entry = json.loads(line)
+        except ValueError:
+            continue
+        payload = entry.get("payload") if isinstance(entry, dict) else None
+        if not isinstance(payload, dict):
+            continue
+        if entry.get("type") == "turn_context" and isinstance(payload.get("model"), str):
+            model = payload["model"]
+            continue
+        boundary = codex_boundary(entry, payload)
+        # With task markers present, a prompt is just part of the task: one
+        # message written in two formats mustn't restart the count.
+        if boundary == "task" or (boundary == "prompt" and not tasks_marked):
+            tasks_marked = tasks_marked or boundary == "task"
+            base = last or [0, 0, 0, 0]
+            summed = [0, 0, 0, 0]
+            seen = True
+        elif entry.get("type") == "event_msg" and payload.get("type") == "token_count":
+            info = payload.get("info") if isinstance(payload.get("info"), dict) else {}
+            def reading(usage):
+                usage = usage if isinstance(usage, dict) else {}
+                return [as_int(usage.get("input_tokens")), as_int(usage.get("cached_input_tokens")),
+                        as_int(usage.get("output_tokens")), as_int(usage.get("cache_write_input_tokens"))]
+            if isinstance(info.get("total_token_usage"), dict):
+                last = reading(info["total_token_usage"])
+            if seen and isinstance(info.get("last_token_usage"), dict):
+                summed = [a + b for a, b in zip(summed, reading(info["last_token_usage"]))]
+    if not seen or last is None:
+        return seen, []
+    delta = [now - before for now, before in zip(last, base)]
+    if any(value < 0 for value in delta):
+        delta = summed  # totals restarted (compaction): add up the requests instead
+    if not any(delta):
+        return seen, []
+    cached = min(delta[1], delta[0])
+    # OpenAI counts cached tokens inside input_tokens.
+    return seen, [{"hour": 0, "agent": "codex", "model": model, "input": delta[0] - cached, "cacheWrite5m": delta[3],
+                   "cacheWrite1h": 0, "cacheRead": cached, "output": delta[2]}]
+
+
+# A long task can push its start out of the usual tail; look further back
+# before giving up instead of reporting nothing.
+CODEX_TAIL_STEPS = (TURN_TAIL_BYTES, 64 << 20, 512 << 20)
+
+
+def codex_turn_usage(path):
+    """Tokens of the last task in a Codex rollout: the running totals after
+    its start minus the totals before it. Mirrors TurnUsage.codex."""
+    if not isinstance(path, str):
+        return []
+    try:
+        size = os.path.getsize(path)
+        for step in CODEX_TAIL_STEPS:
+            seen, usage = codex_usage_in(read_tail(path, step))
+            if seen or step >= size:
+                return usage
+    except OSError:
+        return []
+    return []
 
 
 # ---------------------------------------------------------------- safety net
@@ -761,6 +904,476 @@ def restore_command(snapshot_id, assume_yes):
     ok, message = restore_snapshot(snapshot)
     print(message)
     return 0 if ok else 1
+
+
+# ---------------------------------------------------------------- worker
+#
+# The Mac can't reach into the server, so a small background worker asks it
+# for jobs through the same forwarded port: run the tests, review a diff with
+# the other agent, count changed lines, queue a night task. Results wait in a
+# file until the Mac is reachable again. Night tasks live here, so they run
+# even if the SSH session drops overnight.
+
+RISK_RULES = [
+    (3, r"\b(curl|wget)\b[^|;&]*\|\s*(sudo\s+)?(sh|bash|zsh|python3?|perl|ruby)\b"),
+    (3, r"\brm\s+(-[a-z]*[rf][a-z]*\s+)+(--no-preserve-root\s+)?(/|~|\$HOME|/\*|~/\*|\*)(\s|$)"),
+    (3, r"\bdd\b[^;&|]*\bof=/dev/|>\s*/dev/(disk|sd|nvme)"),
+    (3, r"\b(mkfs(\.\w+)?|diskutil\s+(erase\w*|partitionDisk|zeroDisk))\b"),
+    (3, r":\(\)\s*\{\s*:\|:&\s*\};:"),
+    (3, r"\b(drop\s+(table|database|schema)|truncate\s+table)\b"),
+    (2, r"\brm\s+(?:-[a-z]+\s+)*-[a-z]*r"),
+    (2, r"\bgit\s+push\b[^;&|]*(\s--force(-with-lease)?\b|\s-f\b)"),
+    (2, r"\bgit\s+reset\s+[^;&|]*--hard\b"),
+    (2, r"\bgit\s+clean\s+-[a-z]*f"),
+    (2, r"(^|[;&|]\s*|\s)sudo\s"),
+    (2, r"\bchmod\s+(-R\s+)?0?777\b|\bchown\s+-R\b"),
+    (2, r"\b(kill\s+-9|killall|pkill)\b"),
+    (2, r"\b(shutdown|reboot|halt)\b"),
+    (2, r"\bdocker\s+(system\s+prune|volume\s+(rm|prune)|rm\s+-f)\b"),
+    (2, r"\b(npm\s+publish|cargo\s+publish|twine\s+upload|gem\s+push|gh\s+release\s+create|pod\s+trunk\s+push)\b"),
+    (2, r"(\.ssh/|id_(rsa|ed25519)|\.aws/credentials|\.env\b|keychain|security\s+find-generic-password)"),
+]
+SENSITIVE_PATH = r"(^|/)(\.ssh|\.aws|\.gnupg|\.config/gh)(/|$)|(^|/)\.env(\.|$)|^/(etc|usr|bin|sbin|System|Library)/|(^|/)\.(zshrc|bashrc|bash_profile|zprofile|profile)$|(^|/)(id_rsa|id_ed25519)"
+WRITING_TOOLS = ("Edit", "Write", "MultiEdit", "NotebookEdit", "apply_patch", "ApplyPatch")
+
+
+def risk_level(tool_name, tool_input):
+    """0 safe .. 3 critical, by the same rules as AgentCore.RiskRadar."""
+    import re
+    level = 0
+    command = full_command(tool_input)
+    if command:
+        for rule_level, pattern in RISK_RULES:
+            if rule_level > level and re.search(pattern, command, re.IGNORECASE):
+                level = rule_level
+    if tool_name in WRITING_TOOLS and isinstance(tool_input, dict):
+        path = tool_input.get("file_path") or tool_input.get("path") or tool_input.get("notebook_path")
+        if isinstance(path, str) and re.search(SENSITIVE_PATH, os.path.expanduser(path)):
+            level = max(level, 2)
+    return level
+
+
+def night_output(tool_name, tool_input):
+    """Claude Code's PreToolUse answer for a night task: the careful policy."""
+    level = risk_level(tool_name, tool_input)
+    decision = {"hookEventName": "PreToolUse", "permissionDecision": "deny" if level >= 2 else "allow"}
+    if level >= 2:
+        decision["permissionDecisionReason"] = ("Denny for Agents night shift: this looks dangerous and nobody is "
+                                                "here to approve it. Find a safer way or leave it for the morning.")
+    return json.dumps({"hookSpecificOutput": decision}, sort_keys=True)
+
+
+def start_worker():
+    """Spawns the worker unless one already runs (it holds a lock)."""
+    try:
+        with open(WORKER_LOCK, "a") as handle:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(handle, fcntl.LOCK_UN)
+    except OSError:
+        return
+    try:
+        script = INSTALLED_SCRIPT if os.path.exists(INSTALLED_SCRIPT) else os.path.abspath(__file__)
+        subprocess.Popen([sys.executable, script, "--worker"], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL, start_new_session=True, close_fds=True)
+    except OSError:
+        pass
+
+
+def project_root(cwd):
+    return run_git(cwd, ["rev-parse", "--show-toplevel"]) or cwd
+
+
+def detect_tests(cwd):
+    """(root, command) like AgentCore.TestRunner.detect, or None."""
+    root = project_root(cwd)
+    def has(name):
+        return os.path.exists(os.path.join(root, name))
+    def read(name):
+        try:
+            with open(os.path.join(root, name)) as handle:
+                return handle.read()
+        except (OSError, UnicodeDecodeError):
+            return None
+    custom = read(".denny-test")
+    if custom:
+        for line in custom.splitlines():
+            line = line.strip()
+            if line and not line.startswith("#"):
+                return root, line
+    if has("Package.swift"):
+        return root, "swift test"
+    package = read("package.json")
+    if package:
+        try:
+            script = (json.loads(package).get("scripts") or {}).get("test")
+        except (ValueError, AttributeError):
+            script = None
+        if isinstance(script, str) and "no test specified" not in script:
+            if has("bun.lockb") or has("bun.lock"):
+                return root, "bun run test"
+            if has("pnpm-lock.yaml"):
+                return root, "pnpm test"
+            if has("yarn.lock"):
+                return root, "yarn test"
+            return root, "npm test"
+    if has("Cargo.toml"):
+        return root, "cargo test"
+    if has("go.mod"):
+        return root, "go test ./..."
+    pyproject = read("pyproject.toml") or ""
+    if has("pytest.ini") or has("conftest.py") or "[tool.pytest" in pyproject or \
+            (has("tests") and (has("pyproject.toml") or has("setup.py") or has("requirements.txt"))):
+        return root, "python3 -m pytest -q"
+    makefile = read("Makefile") or ""
+    if any(line.startswith("test:") for line in makefile.splitlines()):
+        return root, "make test"
+    return None
+
+
+def tail_lines(text, count=40):
+    return "\n".join(text.splitlines()[-count:]).strip()
+
+
+def run_shell(arguments, cwd, timeout, env=None):
+    """(exit code or None on timeout, combined output) in a login shell, gently niced."""
+    try:
+        result = subprocess.run(["nice", "-n", "10", "bash", "-lc", '"$0" "$@"'] + arguments, cwd=cwd,
+                                capture_output=True, text=True, timeout=timeout, env=env, errors="replace")
+        return result.returncode, (result.stdout + result.stderr)
+    except subprocess.TimeoutExpired as error:
+        output = error.stdout.decode("utf-8", "replace") if isinstance(error.stdout, bytes) else (error.stdout or "")
+        return None, output
+    except OSError as error:
+        return 127, str(error)
+
+
+def job_tests(job):
+    found = detect_tests(job.get("cwd") or HOME) if os.path.isdir(job.get("cwd") or "") else None
+    if found is None:
+        return {"state": "none"}
+    root, command = found
+    started = time.time()
+    code, output = run_shell(["bash", "-lc", command], root, TEST_TIMEOUT_SECONDS,
+                             env=dict(os.environ, CI="1"))
+    return {"state": "passed" if code == 0 else "failed", "command": command,
+            "output": tail_lines(output) + ("\nStopped after 10 minutes." if code is None else ""),
+            "duration": time.time() - started}
+
+
+def task_diff(cwd, files, limit=120000):
+    repo = run_git(cwd, ["rev-parse", "--show-toplevel"]) if os.path.isdir(cwd or "") else None
+    if not repo or not files:
+        return None
+    text = run_git(repo, ["diff", "HEAD", "--"] + files) or ""
+    for name in (run_git(repo, ["ls-files", "--others", "--exclude-standard", "--full-name", "--"] + files) or "").splitlines():
+        try:
+            with open(os.path.join(repo, name)) as handle:
+                text += "\n\nNew file %s:\n%s" % (name, handle.read())
+        except (OSError, UnicodeDecodeError):
+            continue
+    text = text.strip()
+    if not text:
+        return None
+    return text if len(text) <= limit else text[:limit] + "\n\n[diff cut here: too long]"
+
+
+def review_prompt(author, task, diff):
+    """Same words as AgentCore.CrossReview.prompt."""
+    names = {"claude": "Claude Code", "codex": "Codex"}
+    asked = "The task was: «%s»." % task if task else "The task description isn't available."
+    return ("You are reviewing changes that another AI coding agent (%s) has just made in this project. %s\n\n"
+            "Review them like a careful senior engineer: bugs, regressions, missed edge cases, security problems, "
+            "and anything that doesn't do what was asked. Don't edit any files — only read. You may open other files "
+            "of the project for context.\n\n"
+            "Reply with a short list of concrete findings, most important first, one per line starting with \"- \", "
+            "each with the file and line. If everything looks right, reply with one line saying so and nothing else. "
+            "Write the review in the same language as the task description.\n\n"
+            "The changes (git diff against the last commit):\n\n%s") % (names.get(author, author), asked, diff)
+
+
+def agent_binary(agent):
+    name = "claude" if agent == "claude" else "codex"
+    for path in (os.path.join(HOME, ".local", "bin", name), os.path.join(HOME, ".claude", "local", name),
+                 "/usr/local/bin/" + name, "/usr/bin/" + name):
+        if os.access(path, os.X_OK):
+            return path
+    code, output = run_shell(["sh", "-c", "command -v " + name], HOME, 20)
+    path = output.strip().splitlines()[-1] if code == 0 and output.strip() else ""
+    return path if path.startswith("/") else None
+
+
+def review_arguments(reviewer, prompt):
+    if reviewer == "codex":
+        return ["exec", "--sandbox", "read-only", "--skip-git-repo-check", prompt]
+    return ["-p", prompt, "--allowedTools", "Read,Grep,Glob",
+            "--disallowedTools", "Edit,Write,MultiEdit,NotebookEdit,Bash"]
+
+
+def job_review(job):
+    author = job.get("author") or "claude"
+    reviewer = "codex" if author == "claude" else "claude"
+    binary = agent_binary(reviewer)
+    if not binary:
+        return {"state": "failed", "output": "not found on " + socket.gethostname(), "reviewer": reviewer}
+    diff = task_diff(job.get("cwd"), job.get("files") or [])
+    if not diff:
+        return {"state": "failed", "output": "no changes to review", "reviewer": reviewer}
+    code, output = run_shell([binary] + review_arguments(reviewer, review_prompt(author, job.get("task"), diff)),
+                             project_root(job["cwd"]), REVIEW_TIMEOUT_SECONDS)
+    output = output.strip()
+    if code != 0 or not output:
+        return {"state": "failed", "output": tail_lines(output, 3) or "exit %s" % code, "reviewer": reviewer}
+    return {"state": "done", "output": output, "reviewer": reviewer}
+
+
+def job_lines(job):
+    cwd, files = job.get("cwd"), job.get("files") or []
+    repo = run_git(cwd, ["rev-parse", "--show-toplevel"]) if os.path.isdir(cwd or "") else None
+    if not repo or not files:
+        return {"state": "none"}
+    added = removed = 0
+    counted = set()
+    for line in (run_git(repo, ["diff", "--numstat", "HEAD", "--"] + files) or "").splitlines():
+        parts = line.split("\t", 2)
+        if len(parts) == 3:
+            added += int(parts[0]) if parts[0].isdigit() else 0
+            removed += int(parts[1]) if parts[1].isdigit() else 0
+            counted.add(os.path.join(repo, parts[2]))
+    for name in (run_git(repo, ["ls-files", "--others", "--exclude-standard", "--full-name", "--"] + files) or "").splitlines():
+        path = os.path.join(repo, name)
+        try:
+            if path not in counted and os.path.getsize(path) < 2 << 20:
+                with open(path) as handle:
+                    added += len(handle.read().splitlines())
+        except (OSError, UnicodeDecodeError):
+            continue
+    return {"state": "done", "added": added, "removed": removed}
+
+
+def load_json_list(path):
+    try:
+        with open(path) as handle:
+            data = json.load(handle)
+        return data if isinstance(data, list) else []
+    except (OSError, ValueError):
+        return []
+
+
+def save_json_list(path, items):
+    os.makedirs(BASE_DIR, mode=0o700, exist_ok=True)
+    # A temp file of its own: two writers must never share (and steal) one.
+    descriptor, temp = tempfile.mkstemp(prefix=os.path.basename(path) + ".", suffix=".tmp", dir=os.path.dirname(path))
+    try:
+        with os.fdopen(descriptor, "w") as handle:
+            json.dump(items, handle)
+        os.replace(temp, path)
+    except BaseException:
+        try:
+            os.remove(temp)
+        except OSError:
+            pass
+        raise
+
+
+# Results are added by the test/review thread while the main loop prunes the
+# delivered ones: every read-modify-write of the file goes through this lock.
+RESULTS_LOCK = threading.Lock()
+
+
+def add_result(result):
+    with RESULTS_LOCK:
+        results = load_json_list(RESULTS_PATH)
+        results.append(result)
+        save_json_list(RESULTS_PATH, results[-200:])
+
+
+def drop_delivered_results(delivered):
+    """delivered: the (id, state) pairs the Mac has received."""
+    with RESULTS_LOCK:
+        save_json_list(RESULTS_PATH, [item for item in load_json_list(RESULTS_PATH)
+                                      if (item.get("id"), item.get("state")) not in delivered])
+
+
+def interrupted_nights(nights):
+    """A night job saved as running whose worker is gone (crash, reboot): its
+    process can't be found any more, so say so instead of "running" forever.
+    Never restarted on its own -- it may have done half the work."""
+    for job in nights:
+        if job.get("state") == "running":
+            job["state"] = "failed"
+            add_result({"id": job["id"], "kind": "night", "state": "failed",
+                        "output": "interrupted: the server or its worker restarted"})
+    return nights
+
+
+def night_due(job, now):
+    if job.get("state") != "waiting":
+        return False
+    if isinstance(job.get("at"), (int, float)):
+        return now >= job["at"]
+    if isinstance(job.get("resetsAt"), (int, float)):
+        return now >= job["resetsAt"] + 60
+    return True
+
+
+def start_night_job(job):
+    binary = agent_binary(job.get("agent"))
+    if not binary or not os.path.isdir(job.get("cwd") or ""):
+        return None, "not found"
+    if job.get("agent") == "codex":
+        arguments = ["exec", "--sandbox", "workspace-write", "--skip-git-repo-check", job.get("prompt", "")]
+    else:
+        arguments = ["-p", job.get("prompt", ""), "--permission-mode", "acceptEdits"]
+    try:
+        process = subprocess.Popen(["nice", "-n", "5", "bash", "-lc", '"$0" "$@"', binary] + arguments,
+                                   cwd=job["cwd"], env=dict(os.environ, **{NIGHT_ENV: job["id"]}),
+                                   stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except OSError as error:
+        return None, str(error)
+    return process, None
+
+
+def ask_for_jobs(port, token, results, received=()):
+    """Sends finished results and the ids of jobs already stored here, returns
+    the jobs the Mac still holds for us (or None if it's unreachable). The Mac
+    keeps a job until its id comes back in `received`."""
+    conn = connect(port)
+    if conn is None:
+        return None
+    try:
+        event = {"agent": "claude", "name": "Other", "sessionId": "worker", "host": socket.gethostname(), "home": HOME}
+        request = {"version": 1, "id": str(uuid.uuid4()), "event": event, "wantsDecision": False,
+                   "token": token, "wantsJobs": True, "jobResults": results, "jobsReceived": list(received)}
+        conn.sendall((json.dumps(request) + "\n").encode())
+        line = read_line(conn, 10)
+        if line is None:
+            return None
+        reply = json.loads(line)
+        if reply.get("id") != request["id"]:
+            return None
+        return [job for job in reply.get("jobs") or [] if isinstance(job, dict) and job.get("id")]
+    except (OSError, ValueError, AttributeError):
+        return None
+    finally:
+        conn.close()
+
+
+def next_heavy(queue, nights, busy, running, now):
+    """What may start now, if anything: ("job", job) or ("night", job). One heavy
+    thing at a time -- tests, a review or a night agent -- since they share the
+    server's memory. Tests go first; a due night job waits for them."""
+    if busy or running:
+        return None
+    if queue:
+        return "job", queue[0]
+    for job in nights:
+        if night_due(job, now):
+            return "night", job
+    return None
+
+
+def run_worker():
+    os.makedirs(BASE_DIR, mode=0o700, exist_ok=True)
+    lock = open(WORKER_LOCK, "a")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        return 0
+    running = {}
+    busy = threading.Event()
+    seen = load_json_list(SEEN_PATH)
+    received = []
+    save_json_list(NIGHT_PATH, interrupted_nights(load_json_list(NIGHT_PATH)))
+
+    def work(job):
+        try:
+            handler = {"tests": job_tests, "review": job_review, "lines": job_lines}.get(job.get("kind"))
+            result = handler(job) if handler else {"state": "failed", "output": "unknown job"}
+        except Exception as error:  # a broken job must not stop the worker
+            result = {"state": "failed", "output": str(error)}
+        result.update({"id": job["id"], "kind": job["kind"]})
+        add_result(result)
+        save_json_list(QUEUE_PATH, [item for item in load_json_list(QUEUE_PATH) if item.get("id") != job["id"]])
+        busy.clear()
+
+    started = time.time()
+    while True:
+        config = load_config()
+        if config is None:
+            return 0
+        now = time.time()
+        jobs = None
+        try:
+            pending = load_json_list(RESULTS_PATH)
+            jobs = ask_for_jobs(config[0], config[1], pending, received)
+            if jobs is not None:
+                if pending:
+                    drop_delivered_results({(item.get("id"), item.get("state")) for item in pending})
+                # Store every new job first, then remember its id, then
+                # acknowledge it on the next request -- a lost reply only
+                # means the Mac sends it again and it's recognised here.
+                nights = load_json_list(NIGHT_PATH)
+                queue = load_json_list(QUEUE_PATH)
+                for job in jobs:
+                    if job["id"] in seen:
+                        continue
+                    if job.get("kind") == "night":
+                        job["state"] = "waiting"
+                        nights.append(job)
+                        add_result({"id": job["id"], "kind": "night", "state": "queued"})
+                    elif job.get("kind") == "cancel":
+                        for item in nights:
+                            if item.get("id") == job.get("target") and item.get("state") in ("waiting", "running"):
+                                item["state"] = "cancelled"
+                                if item["id"] in running:
+                                    running[item["id"]][0].terminate()
+                    else:
+                        queue.append(job)
+                save_json_list(NIGHT_PATH, nights)
+                save_json_list(QUEUE_PATH, queue)
+                seen = (seen + [job["id"] for job in jobs if job["id"] not in seen])[-SEEN_KEEP:]
+                save_json_list(SEEN_PATH, seen)
+                received = [job["id"] for job in jobs]
+            nights = load_json_list(NIGHT_PATH)
+            queue = load_json_list(QUEUE_PATH)
+            heavy = next_heavy(queue, nights, busy.is_set(), running, now)
+            if heavy and heavy[0] == "job":
+                busy.set()
+                threading.Thread(target=work, args=(heavy[1],), daemon=True).start()
+            elif heavy:
+                job = heavy[1]
+                process, error = start_night_job(job)
+                if process is None:
+                    job["state"] = "failed"
+                    add_result({"id": job["id"], "kind": "night", "state": "failed", "output": error})
+                else:
+                    job["state"] = "running"
+                    running[job["id"]] = (process, now)
+                    add_result({"id": job["id"], "kind": "night", "state": "running"})
+            for job_id, (process, since) in list(running.items()):
+                if process.poll() is None and now - since > NIGHT_TIMEOUT_SECONDS:
+                    process.terminate()
+                if process.poll() is not None:
+                    del running[job_id]
+                    code = process.returncode
+                    for job in nights:
+                        if job.get("id") == job_id and job.get("state") == "running":
+                            job["state"] = "done" if code == 0 else "failed"
+                            add_result({"id": job_id, "kind": "night", "state": job["state"],
+                                        "output": None if code == 0 else "exit %s" % code})
+            save_json_list(NIGHT_PATH, [job for job in nights if job.get("state") in ("waiting", "running")]
+                           + [job for job in nights if job.get("state") not in ("waiting", "running")][-20:])
+        except Exception:  # one bad turn (a full disk, a broken file) must not end the worker
+            nights, queue = load_json_list(NIGHT_PATH), load_json_list(QUEUE_PATH)
+        try:
+            activity = os.path.getmtime(ACTIVITY_STAMP)
+        except OSError:
+            activity = started
+        waiting = any(job.get("state") in ("waiting", "running") for job in nights)
+        if not waiting and not queue and not busy.is_set() and not running \
+                and not load_json_list(RESULTS_PATH) and now - max(activity, started) > WORKER_IDLE_SECONDS:
+            return 0
+        time.sleep(3 if jobs is not None else 15)
 
 
 # ---------------------------------------------------------------- usage report
@@ -1484,6 +2097,24 @@ def write_json(path, data):
     os.replace(temporary, path)
 
 
+def set_port(port):
+    """Denny keeps the SSH tunnel itself; when 47321 is still held by a dead
+    session it lands on the next port and tells the hook here."""
+    try:
+        with open(CONFIG_PATH) as handle:
+            config = json.load(handle)
+    except (OSError, ValueError):
+        return 1
+    if not isinstance(config, dict) or not 1024 <= port <= 65535:
+        return 2
+    config["port"] = port
+    descriptor = os.open(CONFIG_PATH + ".part", os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(descriptor, "w") as handle:
+        json.dump(config, handle)
+    os.replace(CONFIG_PATH + ".part", CONFIG_PATH)
+    return 0
+
+
 def install(port, token, agents):
     os.makedirs(BASE_DIR, mode=0o700, exist_ok=True)
     source = os.path.abspath(__file__)
@@ -1590,6 +2221,11 @@ def main(argv):
     if "--codex-reset" in argv:
         sys.stdout.write(json.dumps(codex_reset()) + "\n")
         return 0
+    if "--worker" in argv:
+        try:
+            return run_worker()
+        except Exception:
+            return 0
     if "--clear-snapshots" in argv:
         return clear_snapshots()
     if "--snapshots" in argv:
@@ -1603,6 +2239,14 @@ def main(argv):
     if "--report" in argv:
         sys.stdout.write(json.dumps(build_report()) + "\n")
         return 0
+    if "--set-port" in argv:
+        position = argv.index("--set-port")
+        try:
+            return set_port(int(argv[position + 1]))
+        except (IndexError, ValueError):
+            print(__doc__)
+            return 2
+
     if "--install" in argv:
         def value(flag):
             if flag in argv and argv.index(flag) + 1 < len(argv):

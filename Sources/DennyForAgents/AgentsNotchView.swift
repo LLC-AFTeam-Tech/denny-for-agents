@@ -429,6 +429,8 @@ struct ReceiptCard: View {
             Text(L.testsPassed(duration)).font(.system(size: 11, weight: .semibold)).foregroundColor(.green)
         case .failed:
             Text(L.testsFailed(duration)).font(.system(size: 11, weight: .semibold)).foregroundColor(.red)
+        case .unavailable(let reason):
+            Text(reason).font(.system(size: 11)).foregroundColor(.white.opacity(0.6))
         }
     }
 }

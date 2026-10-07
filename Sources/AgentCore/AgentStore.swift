@@ -147,6 +147,8 @@ public struct AgentStore: Equatable, Sendable {
         let key = Self.key(agent: event.agent, sessionId: event.sessionId)
         let texts = Texts(language: language)
 
+        // Placeholders (usage reports, the server worker) aren't sessions.
+        if event.name == .other { return [] }
         if event.name == .sessionEnd {
             sessions[key] = nil
             approvals.removeAll { $0.sessionKey == key }

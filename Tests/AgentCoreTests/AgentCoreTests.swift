@@ -634,6 +634,10 @@ final class LimitFreshnessTests: XCTestCase {
         let passed = UsageReport.Window(kind: "weekly", percent: 100, resetsAt: now - 60).current(observedAt: now - 3600, now: now)
         XCTAssertEqual(passed.percent, 0)
         XCTAssertFalse(passed.isStale)
+        // Long after the reset with nothing new: unknown, not a frozen 0%.
+        let longPassed = UsageReport.Window(kind: "session", percent: 70, resetsAt: now - 2 * 86400).current(observedAt: now - 3 * 86400, now: now)
+        XCTAssertEqual(longPassed.percent, 0)
+        XCTAssertTrue(longPassed.isStale)
 
         let oldSession = UsageReport.Window(kind: "session", percent: 100).current(observedAt: now - 7 * 3600, now: now)
         XCTAssertTrue(oldSession.isStale)
@@ -1153,5 +1157,212 @@ final class NightShiftTests: XCTestCase {
         NightShift.save([job], home: home)
         XCTAssertEqual(NightShift.load(home: home), [job])
         XCTAssertEqual(NightShift.arguments(job), ["-p", "fix the tests", "--permission-mode", "acceptEdits"])
+    }
+}
+
+final class CodexTurnUsageTests: XCTestCase {
+    func testCountsTheLastTaskFromRunningTotals() throws {
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("rollout-\(UUID().uuidString).jsonl")
+        defer { try? FileManager.default.removeItem(at: url) }
+        func tokens(_ input: Int, _ cached: Int, _ output: Int) -> [String: Any] {
+            ["type": "event_msg", "payload": ["type": "token_count", "info": [
+                "total_token_usage": ["input_tokens": input, "cached_input_tokens": cached, "output_tokens": output]]]]
+        }
+        let entries: [[String: Any]] = [
+            ["type": "turn_context", "payload": ["model": "gpt-5.6-sol"]],
+            ["type": "event_msg", "payload": ["type": "user_message", "message": "old"]],
+            tokens(1000, 800, 50),
+            ["type": "event_msg", "payload": ["type": "user_message", "message": "new"]],
+            tokens(1500, 1100, 80),
+            tokens(2200, 1700, 120),
+        ]
+        let text = try entries.map { String(decoding: try JSONSerialization.data(withJSONObject: $0), as: UTF8.self) }
+            .joined(separator: "\n") + "\n"
+        try text.write(to: url, atomically: true, encoding: .utf8)
+        let usage = TurnUsage.codex(rollout: url.path)
+        XCTAssertEqual(usage.count, 1)
+        XCTAssertEqual(usage.first?.model, "gpt-5.6-sol")
+        XCTAssertEqual(usage.first?.cacheRead, 900)
+        XCTAssertEqual(usage.first?.input, 300)
+        XCTAssertEqual(usage.first?.output, 70)
+        XCTAssertEqual(usage.first?.agent, .codex)
+    }
+
+    private func writeRollout(_ entries: [[String: Any]]) throws -> URL {
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("rollout-\(UUID().uuidString).jsonl")
+        let text = try entries.map { String(decoding: try JSONSerialization.data(withJSONObject: $0), as: UTF8.self) }
+            .joined(separator: "\n") + "\n"
+        try text.write(to: url, atomically: true, encoding: .utf8)
+        return url
+    }
+
+    private func totals(_ input: Int, _ cached: Int, _ output: Int) -> [String: Any] {
+        ["type": "event_msg", "payload": ["type": "token_count", "info": [
+            "total_token_usage": ["input_tokens": input, "cached_input_tokens": cached, "output_tokens": output]]]]
+    }
+
+    /// Today's Codex: task_started, the prompt as response_item role=user and
+    /// item_completed UserMessage, no old user_message. Counted once, from the
+    /// task start, not restarted by a message in the middle.
+    func testCurrentCodexFormatIsCountedOncePerTask() throws {
+        let url = try writeRollout([
+            ["type": "turn_context", "payload": ["model": "gpt-5.6-sol"]],
+            ["type": "event_msg", "payload": ["type": "task_started"]],
+            ["type": "response_item", "payload": ["type": "message", "role": "user"]],
+            totals(1000, 800, 50),
+            ["type": "event_msg", "payload": ["type": "task_complete"]],
+            ["type": "event_msg", "payload": ["type": "task_started"]],
+            ["type": "response_item", "payload": ["type": "message", "role": "user"]],
+            ["type": "event_msg", "payload": ["type": "item_completed", "item": ["type": "UserMessage"]]],
+            totals(1100, 850, 80),
+            ["type": "response_item", "payload": ["type": "message", "role": "user"]],
+            totals(1105, 900, 105),
+        ])
+        defer { try? FileManager.default.removeItem(at: url) }
+        let usage = TurnUsage.codex(rollout: url.path)
+        XCTAssertEqual(usage.count, 1)
+        XCTAssertEqual(usage.first?.input, 5)
+        XCTAssertEqual(usage.first?.cacheRead, 100)
+        XCTAssertEqual(usage.first?.output, 55)
+    }
+
+    func testLongCodexTaskWhoseStartLeftTheTailIsStillFound() throws {
+        let filler: [String: Any] = ["type": "response_item", "payload": ["type": "reasoning", "summary": [String(repeating: "x", count: 400)]]]
+        let url = try writeRollout([totals(100, 0, 10), ["type": "event_msg", "payload": ["type": "task_started"]]]
+                                   + Array(repeating: filler, count: 50) + [totals(300, 0, 40)])
+        defer { try? FileManager.default.removeItem(at: url) }
+        XCTAssertTrue(TurnUsage.codex(rollout: url.path, tailSteps: [2000]).isEmpty)
+        let usage = TurnUsage.codex(rollout: url.path, tailSteps: [2000, 1 << 20])
+        XCTAssertEqual(usage.first?.input, 200)
+        XCTAssertEqual(usage.first?.output, 30)
+    }
+
+    func testFindsTheRolloutBySessionId() throws {
+        let home = FileManager.default.temporaryDirectory.appendingPathComponent("codex-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: home) }
+        let folder = home.appendingPathComponent(".codex/sessions/2025/01/02")
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        let file = folder.appendingPathComponent("rollout-2025-01-02T10-00-00-abc-123.jsonl")
+        FileManager.default.createFile(atPath: file.path, contents: Data())
+        let payload = try JSONSerialization.data(withJSONObject: ["session_id": "abc-123"])
+        XCTAssertEqual(TurnUsage.codexRollout(payload: payload, home: home), file.path)
+        let sneaky = try JSONSerialization.data(withJSONObject: ["session_id": "../x"])
+        XCTAssertNil(TurnUsage.codexRollout(payload: sneaky, home: home))
+    }
+}
+
+final class RemoteJobTests: XCTestCase {
+    func testJobsSpeakTheWorkersLanguage() throws {
+        let job = NightJob(agent: .codex, folder: "/srv/shop", prompt: "fix", trigger: .at(Date(timeIntervalSince1970: 500)), host: "vps")
+        let remote = RemoteJob(night: job)
+        let json = try XCTUnwrap(JSONSerialization.jsonObject(with: JSONEncoder().encode(JobBatch(id: "r", jobs: [remote]))) as? [String: Any])
+        let first = try XCTUnwrap((json["jobs"] as? [[String: Any]])?.first)
+        XCTAssertEqual(first["kind"] as? String, "night")
+        XCTAssertEqual(first["agent"] as? String, "codex")
+        XCTAssertEqual(first["cwd"] as? String, "/srv/shop")
+        XCTAssertEqual(first["at"] as? Double, 500)
+        XCTAssertEqual(first["id"] as? String, job.id)
+        // What the Python worker sends back.
+        let request = """
+        {"version":1,"id":"q","event":{"agent":"claude","name":"Other","sessionId":"worker","host":"vps"},
+         "wantsDecision":false,"token":"t","wantsJobs":true,
+         "jobResults":[{"id":"j","kind":"tests","state":"failed","command":"npm test","output":"boom","duration":3.5}]}
+        """
+        let decoded = try BridgeCodec.decode(BridgeRequest.self, line: Data(request.utf8))
+        XCTAssertEqual(decoded.wantsJobs, true)
+        XCTAssertEqual(decoded.jobResults?.first?.state, "failed")
+        XCTAssertEqual(decoded.jobResults?.first?.kind, .tests)
+    }
+
+    func testPlaceholderEventsAreNotSessions() {
+        var store = AgentStore(language: .en)
+        store.apply(HookEvent(agent: .claude, name: .other, sessionId: "worker", host: "vps"))
+        XCTAssertTrue(store.sessions.isEmpty)
+    }
+}
+
+final class SSHLinkTests: XCTestCase {
+    func testDestinationsAreUserAtHostOrAliasNeverAnOption() {
+        XCTAssertTrue(SSHLink.isValidDestination("root@203.0.113.7"))
+        XCTAssertTrue(SSHLink.isValidDestination("my-vps"))
+        XCTAssertTrue(SSHLink.isValidDestination(" deploy@app.example.com "))
+        XCTAssertFalse(SSHLink.isValidDestination("-oProxyCommand=touch /tmp/x"))
+        XCTAssertFalse(SSHLink.isValidDestination("root@host; rm -rf ~"))
+        XCTAssertFalse(SSHLink.isValidDestination("a@b@c"))
+        XCTAssertFalse(SSHLink.isValidDestination("root@"))
+        XCTAssertFalse(SSHLink.isValidDestination(""))
+    }
+
+    func testTunnelForwardsTheServerPortToThisMacAndNeverPrompts() {
+        let args = SSHLink.tunnelArguments(destination: "root@srv", remotePort: 47322, localPort: 47321, controlPath: "/tmp/c")
+        XCTAssertEqual(Array(args.suffix(4)), ["-R", "127.0.0.1:47322:127.0.0.1:47321", "--", "root@srv"])
+        XCTAssertTrue(args.contains("BatchMode=yes"))
+        XCTAssertTrue(args.contains("ExitOnForwardFailure=yes"))
+        XCTAssertTrue(args.contains("-N"))
+        let command = SSHLink.commandArguments(destination: "root@srv", controlPath: "/tmp/c", command: SSHLink.reportCommand)
+        XCTAssertEqual(Array(command.suffix(3)), ["--", "root@srv", SSHLink.reportCommand])
+    }
+
+    func testInstallCommandCarriesOnlyPortAndHexToken() {
+        let command = SSHLink.installCommand(port: 47321, token: "ab12")
+        XCTAssertTrue(command.hasSuffix("--install --port 47321 --token ab12"))
+        XCTAssertTrue(command.contains("cat > ~/.denny-for-agents/denny-hook.py.part"))
+    }
+
+    func testFailuresAreExplained() {
+        XCTAssertEqual(SSHLink.classify(stderr: "root@srv: Permission denied (publickey)."), .needsKey)
+        XCTAssertEqual(SSHLink.classify(stderr: "Error: remote port forwarding failed for listen port 47321"), .portBusy)
+        XCTAssertEqual(SSHLink.classify(stderr: "ssh: Could not resolve hostname nope: nodename nor servname provided"), .unreachable)
+        XCTAssertEqual(SSHLink.classify(stderr: "@@@ WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED! @@@"), .hostKeyChanged)
+        XCTAssertEqual(SSHLink.classify(stderr: "bash: python3: command not found"), .noPython)
+        XCTAssertEqual(SSHLink.classify(stderr: "something odd\nClient loop: send disconnect"), .other("Client loop: send disconnect"))
+        XCTAssertEqual(SSHLink.retryDelay(attempt: 0), 2)
+        XCTAssertEqual(SSHLink.retryDelay(attempt: 99), 60)
+    }
+}
+
+final class JobOutboxTests: XCTestCase {
+    func testAJobStaysUntilTheServerSaysItIsStored() {
+        var outbox = JobOutbox()
+        let tests = RemoteJob(id: "t1", kind: .tests, cwd: "/srv/app")
+        let cancel = RemoteJob(id: "c1", kind: .cancel, target: "n1")
+        outbox.add(tests, host: "srv")
+        outbox.add(cancel, host: "srv")
+        // The reply with both jobs got lost on a dropped connection: next time
+        // the worker acknowledges nothing, and gets them again.
+        XCTAssertEqual(outbox.deliver(host: "srv", received: []).map(\.id), ["t1", "c1"])
+        XCTAssertEqual(outbox.deliver(host: "srv", received: []).map(\.id), ["t1", "c1"])
+        // It stored the tests job: only the cancel is left.
+        XCTAssertEqual(outbox.deliver(host: "srv", received: ["t1"]).map(\.id), ["c1"])
+        XCTAssertEqual(outbox.deliver(host: "srv", received: ["c1"]).map(\.id), [])
+        XCTAssertNil(outbox.waiting["srv"])
+    }
+
+    func testUnacknowledgedJobsSurviveARestartOfTheApp() throws {
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("outbox-\(UUID().uuidString).json")
+        defer { try? FileManager.default.removeItem(at: url) }
+        var outbox = JobOutbox()
+        outbox.add(RemoteJob(id: "n1", kind: .night, cwd: "/srv/app", agent: .claude, prompt: "fix"), host: "srv")
+        outbox.receipts["t9"] = "r9"
+        outbox.save(to: url)
+        var restored = JobOutbox.load(from: url)
+        XCTAssertEqual(restored, outbox)
+        XCTAssertEqual(restored.deliver(host: "srv", received: []).map(\.id), ["n1"])
+        XCTAssertEqual(restored.receipts["t9"], "r9")
+    }
+
+    func testAResentResultIsAppliedOnce() {
+        var outbox = JobOutbox()
+        let done = RemoteJobResult(id: "n1", kind: .night, state: "done")
+        let running = RemoteJobResult(id: "n1", kind: .night, state: "running")
+        XCTAssertEqual(outbox.fresh([running, done]), [running, done])
+        XCTAssertEqual(outbox.fresh([running, done]), [])  // the worker resent: our reply got lost
+    }
+
+    func testAnOlderHookWithoutAcksGetsTheJobsOnce() {
+        var outbox = JobOutbox()
+        outbox.add(RemoteJob(id: "t1", kind: .tests), host: "srv")
+        XCTAssertEqual(outbox.deliver(host: "srv", received: nil).map(\.id), ["t1"])
+        XCTAssertEqual(outbox.deliver(host: "srv", received: nil).map(\.id), [])
     }
 }
