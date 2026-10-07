@@ -44,6 +44,9 @@ public struct OfficeTask: Codable, Equatable, Sendable, Identifiable {
     public var report: OfficeReport?
     /// Given from Telegram: the report goes back there even if the user is at the Mac.
     public var fromPhone: Bool?
+    /// "Rework" remarks waiting their turn: a rework goes through the same
+    /// queue as a new task (one per folder, a couple at a time).
+    public var rework: String?
 
     public init(id: String = UUID().uuidString, prompt: String, agent: AgentKind, folder: String, host: String? = nil,
                 createdAt: Date = Date()) {
@@ -200,8 +203,10 @@ public enum Office {
         job.id = UUID().uuidString
         job.kind = .officeRework
         job.target = task.id
-        job.prompt = reworkPrompt(remarks.trimmingCharacters(in: .whitespacesAndNewlines))
+        let text = remarks.trimmingCharacters(in: .whitespacesAndNewlines)
         job.resume = task.sessionId.flatMap { PhoneReplies.isValidSession($0) ? $0 : nil }
+        // Without the session the agent starts over: it needs the task itself too.
+        job.prompt = job.resume == nil ? task.prompt + "\n\n" + reworkPrompt(text) : reworkPrompt(text)
         return job
     }
 
@@ -220,6 +225,8 @@ public enum Office {
         case "acceptFailed": return true  // stays for review; the caller shows why
         default: return false
         }
+        // The server knows the session even when the Mac missed its events.
+        if let session = result.session, PhoneReplies.isValidSession(session) { task.sessionId = session }
         if result.state == "review" || result.state == "failed" {
             var report = task.report ?? OfficeReport()
             if let files = result.files { report.files = files }
@@ -398,13 +405,30 @@ public enum OfficeWorkspace {
         return root.status == 0 && !root.text.isEmpty ? root.text : nil
     }
 
-    /// Commits whatever the agent changed but didn't commit itself.
+    /// Commits whatever the agent changed but didn't commit itself. nil when
+    /// done (or nothing to commit, or no working copy); else what git said —
+    /// then the work is only in the working copy, which must be kept.
     @discardableResult
-    public static func commitLeftovers(_ task: OfficeTask) -> Bool {
-        guard let copy = copyRoot(of: task) else { return false }
-        guard git(Office.Git.stageAll(copy)).status == 0 else { return false }
-        guard git(Office.Git.hasStaged(copy)).status == 1 else { return true }
-        return git(Office.Git.commit(copy, message: Office.commitMessage(task))).status == 0
+    public static func commitLeftovers(_ task: OfficeTask) -> String? {
+        guard let copy = copyRoot(of: task) else { return nil }
+        let staged = git(Office.Git.stageAll(copy))
+        guard staged.status == 0 else { return staged.text.isEmpty ? "git add" : staged.text }
+        guard git(Office.Git.hasStaged(copy)).status == 1 else { return nil }
+        let committed = git(Office.Git.commit(copy, message: Office.commitMessage(task)))
+        return committed.status == 0 ? nil : (committed.text.isEmpty ? "git commit" : committed.text)
+    }
+
+    /// A merge, rebase, cherry-pick or revert the user hasn't finished in the
+    /// project: nothing may be merged into it then (and nothing aborted).
+    static func unfinishedOperation(repo: String) -> String? {
+        for (marker, name) in [("MERGE_HEAD", "merge"), ("rebase-merge", "rebase"), ("rebase-apply", "rebase"),
+                               ("CHERRY_PICK_HEAD", "cherry-pick"), ("REVERT_HEAD", "revert")] {
+            let path = git(["-C", repo, "rev-parse", "--git-path", marker]).text
+            guard !path.isEmpty else { continue }
+            let full = path.hasPrefix("/") ? path : (repo as NSString).appendingPathComponent(path)
+            if FileManager.default.fileExists(atPath: full) { return name }
+        }
+        return nil
     }
 
     /// numstat of the task's branch against where it started (after committing leftovers).
@@ -418,10 +442,16 @@ public enum OfficeWorkspace {
     /// removes the working copy. The error text (a conflict, say) otherwise.
     public static func accept(_ task: OfficeTask) -> String? {
         guard let branch = task.branch, let repo = repo(of: task) else { return nil }
-        commitLeftovers(task)
+        // The agent's last changes must be on the branch first: otherwise the
+        // merge says "up to date" and removing the copy would lose them.
+        if let error = commitLeftovers(task) { return "git commit: " + error }
+        if let operation = unfinishedOperation(repo: repo) {
+            return "the project has an unfinished git \(operation): finish it first"
+        }
         let merged = git(Office.Git.merge(repo: repo, branch: branch, message: Office.commitMessage(task)))
         guard merged.status == 0 else {
-            _ = git(["-C", repo, "merge", "--abort"])
+            // Only a merge this call started is undone (none was going on before).
+            if unfinishedOperation(repo: repo) == "merge" { _ = git(["-C", repo, "merge", "--abort"]) }
             return merged.text.isEmpty ? "git merge" : merged.text
         }
         removeCopy(task, repo: repo, branch: branch, force: false)

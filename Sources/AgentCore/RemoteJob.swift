@@ -79,6 +79,8 @@ public struct RemoteJobResult: Codable, Equatable, Sendable {
     public var testOutput: String?
     public var review: String?
     public var tokens: Int?
+    /// Office: the agent's session on the server, for "Rework".
+    public var session: String?
 
     public init(id: String, kind: RemoteJob.Kind, state: String, command: String? = nil, output: String? = nil,
                 duration: Double? = nil, added: Int? = nil, removed: Int? = nil, reviewer: AgentKind? = nil) {

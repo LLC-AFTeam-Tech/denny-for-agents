@@ -254,6 +254,8 @@ extension Translations {
         "phone.denied": "❌ 거부됨",
         "phone.expired": "⌛ 여기서 응답 없음 — 에이전트가 자기 터미널에서 물어봐요.",
         "phone.replyHint": "↩️ 이 메시지에 답장해서 에이전트에게 다음 할 일을 알려 주세요.",
+        "phone.finishedTask": "📝 작업: %@",
+        "phone.finishedFiles": "📄 바뀐 파일: %1$ld개 (%2$@)",
         "phone.replyUnknown": "✅ 완료 메시지에 답장하면 그 에이전트에게 다음 할 일을 알려 줄 수 있어요.",
         "phone.replyLive": "%@이(가) 답장을 받고 터미널에서 계속해요.",
         "phone.replyBackground": "%1$@이(가) %2$@에서 백그라운드로 계속해요(신중 모드: 당신 없이 위험한 일은 안 해요). 끝나면 Telegram으로 알려 줄게요.",
@@ -433,6 +435,7 @@ extension Translations {
         "risk.reason.network": "네트워크에 접근해요.",
         "risk.reason.gitHistory": "git 기록을 다시 쓰거나 파일 변경을 되돌려요.",
         "risk.reason.sensitiveFile": "민감한 파일을 바꿔요: %@.",
+        "risk.reason.clipped": "요청이 너무 길어서 전부 확인할 수 없어요 — 위험으로 처리해요.",
         "risk.reason.externalTool": "외부 도구(MCP 서버)를 사용해요.",
 
         "load.thisMac": "이 Mac",

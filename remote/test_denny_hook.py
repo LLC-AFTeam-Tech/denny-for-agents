@@ -1,6 +1,8 @@
+import atexit
 import io
 import json
 import os
+import shutil
 import socket
 import subprocess
 import sys
@@ -13,6 +15,21 @@ from importlib.machinery import SourceFileLoader
 HERE = os.path.dirname(os.path.abspath(__file__))
 hook = SourceFileLoader("denny_hook", os.path.join(HERE, "denny-hook.py")).load_module()
 hook.start_worker = lambda: None  # tests never spawn the background worker
+
+# Every temporary folder a test makes is removed after the run: some hold
+# 100+ MB files (safety-net size limits) and they used to pile up in /tmp.
+_made_dirs = []
+_mkdtemp = tempfile.mkdtemp
+
+
+def _tracked_mkdtemp(*args, **kwargs):
+    path = _mkdtemp(*args, **kwargs)
+    _made_dirs.append(path)
+    return path
+
+
+tempfile.mkdtemp = _tracked_mkdtemp
+atexit.register(lambda: [shutil.rmtree(path, ignore_errors=True) for path in _made_dirs])
 
 
 class FakeDenny:
@@ -562,6 +579,21 @@ class SafetyNetTests(unittest.TestCase):
         with open(os.path.join(outside, "a.csv")) as handle:
             self.assertEqual(handle.read(), "1,2\n")
 
+    def test_ignored_child_must_restore(self):
+        # Astra 10-07 (A6): src is tracked, src/settings.local is ignored; "rm -rf src" lost it.
+        self.write(".gitignore", ".env\nsettings.local\n")
+        self.git("add", "-A")
+        self.git("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "ignore")
+        self.write("src/settings.local", "token=local\n")
+        snapshot = hook.take_snapshot("rm -rf src", self.repo, "claude")
+        self.assertEqual([os.path.join(self.repo, "src/settings.local")], [item["original"] for item in snapshot["copies"]])
+        import shutil
+        shutil.rmtree(os.path.join(self.repo, "src"))
+        ok, _ = hook.restore_snapshot(snapshot)
+        self.assertTrue(ok)
+        self.assertEqual("print('v1')\n", self.read("src/main.py"))
+        self.assertEqual("token=local\n", self.read("src/settings.local"))
+
     def test_no_snapshot_for_safe_commands_or_nothing_to_save(self):
         self.assertIsNone(hook.take_snapshot("git status", self.repo, "claude"))
         plain = os.path.join(self.home, "plain")
@@ -882,6 +914,29 @@ class WorkerTests(unittest.TestCase):
         self.assertEqual({"a", "b"}, {item["id"] for item in hook.load_json_list(hook.RESULTS_PATH)})
         self.assertEqual([], [name for name in os.listdir(hook.BASE_DIR) if name.endswith(".tmp")])
 
+    def test_finishing_job_must_not_erase_newly_received_job(self):
+        # Astra 10-07 (A5): the finishing thread wrote back an old queue over a job just received.
+        hook.save_json_list(hook.QUEUE_PATH, [{"id": "a", "kind": "tests"}])
+        original = hook.load_json_list
+        gate = threading.Barrier(2)
+        def slow_load(path):
+            items = original(path)
+            if path == hook.QUEUE_PATH:
+                try:
+                    gate.wait(0.2)  # both read before either writes, unless the lock stops them
+                except threading.BrokenBarrierError:
+                    pass
+            return items
+        hook.load_json_list = slow_load
+        try:
+            finishing = threading.Thread(target=hook.queue_remove, args=("a",))
+            finishing.start()
+            hook.queue_add([{"id": "b", "kind": "tests"}])
+            finishing.join(5)
+        finally:
+            hook.load_json_list = original
+        self.assertEqual(["b"], [job["id"] for job in hook.load_json_list(hook.QUEUE_PATH)])
+
     def test_one_heavy_thing_at_a_time(self):
         night = {"id": "n", "kind": "night", "state": "waiting", "at": 0}
         tests = {"id": "t", "kind": "tests"}
@@ -1034,6 +1089,49 @@ class OfficeWorkerTests(unittest.TestCase):
         status = subprocess.run(["git", "-C", self.repo, "status", "--porcelain"], capture_output=True, text=True).stdout
         self.assertEqual("", status.strip())  # the merge was aborted cleanly
 
+    def test_commit_failure_must_keep_work(self):
+        # Astra 10-07 (A1): git can't commit (no author) -> "accepted" and the copy was removed.
+        task = self.task()
+        hook.office_prepare(task)
+        with open(os.path.join(task["workdir"], "b.txt"), "w") as handle:
+            handle.write("work\n")
+        for args in (["config", "user.useConfigOnly", "true"], ["config", "user.name", ""], ["config", "user.email", ""]):
+            subprocess.run(["git", "-C", self.repo] + args, check=True, capture_output=True)
+        self.assertEqual("failed", hook.office_finish(task, 0))
+        self.assertIn("git commit", self.results()[-1]["output"])
+        task["state"] = "failed"
+        hook.office_decide(task, True)
+        self.assertEqual("acceptFailed", self.results()[-1]["state"])
+        self.assertNotEqual("accepted", task["state"])
+        self.assertTrue(os.path.exists(os.path.join(task["workdir"], "b.txt")))  # the work is still there
+
+    def test_accept_must_not_abort_users_merge(self):
+        # Astra 10-07 (A2): the user is in the middle of resolving a merge conflict.
+        task = self.task()
+        hook.office_prepare(task)
+        with open(os.path.join(task["workdir"], "c.txt"), "w") as handle:
+            handle.write("task\n")
+        hook.office_commit_leftovers(task)
+        run = lambda *args: subprocess.run(["git", "-C", self.repo] + list(args), capture_output=True, text=True)
+        run("checkout", "-q", "-b", "side")
+        with open(os.path.join(self.repo, "web", "a.txt"), "w") as handle:
+            handle.write("side\n")
+        run("commit", "-qam", "side")
+        run("checkout", "-q", "main")
+        with open(os.path.join(self.repo, "web", "a.txt"), "w") as handle:
+            handle.write("main\n")
+        run("commit", "-qam", "main")
+        run("merge", "side")  # conflict
+        with open(os.path.join(self.repo, "web", "a.txt"), "w") as handle:
+            handle.write("resolved by hand\n")
+        run("add", "web/a.txt")
+        hook.office_decide(task, True)
+        self.assertEqual("acceptFailed", self.results()[-1]["state"])
+        self.assertIn("merge", self.results()[-1]["output"])
+        self.assertEqual(0, run("rev-parse", "-q", "--verify", "MERGE_HEAD").returncode)  # the user's merge is intact
+        with open(os.path.join(self.repo, "web", "a.txt")) as handle:
+            self.assertEqual("resolved by hand\n", handle.read())
+
     def test_a_folder_outside_git_is_used_as_it_is(self):
         plain = tempfile.mkdtemp()
         task = self.task(plain)
@@ -1073,6 +1171,15 @@ class OfficeWorkerTests(unittest.TestCase):
         self.assertEqual(("queued", {"prompt": "more", "resume": "s-1"}), (office[0]["state"], office[0]["rework"]))
         hook.office_take({"id": "c1", "kind": "cancel", "target": "t1"}, office, {})
         self.assertEqual("discarded", office[0]["state"])
+
+    def test_rework_uses_the_session_the_server_knows(self):
+        # Astra 10-07 (A7): the Mac missed the session; the server noted it from the hook.
+        hook.remember_office_session("t1", "s-42")
+        office = [{"id": "t1", "state": "review", "prompt": "Add the form", "agent": "codex"}]
+        hook.office_take({"id": "r1", "kind": "officeRework", "target": "t1", "prompt": "Add the form\n\nmore"}, office, {})
+        self.assertEqual("s-42", office[0]["rework"]["resume"])
+        hook.office_result(office[0], "review")
+        self.assertEqual("s-42", self.results()[-1]["session"])
 
     def test_one_heavy_thing_at_a_time_tests_then_office_then_night(self):
         night = {"id": "n", "state": "waiting", "at": 0}
@@ -1172,6 +1279,39 @@ class OfficeWorkerTests(unittest.TestCase):
         hook.remember_office_session("t1", "s-9")
         self.assertEqual("s-9", hook.office_session("t1"))
         self.assertIsNone(hook.office_session("t2"))
+
+
+
+class ReviewOutsideGitTests(unittest.TestCase):
+    def test_files_outside_git_are_reviewed_as_they_are(self):
+        folder = tempfile.mkdtemp()
+        path = os.path.join(folder, "plan.md")
+        with open(path, "w") as handle:
+            handle.write("# Plan\nstep one\n")
+        text = hook.task_diff(folder, [path])
+        self.assertIn("outside git", text)
+        self.assertIn("step one", text)
+        self.assertIsNone(hook.task_diff(folder, []))
+        self.assertIsNone(hook.task_diff(folder, [os.path.join(folder, "missing.md")]))
+
+
+
+class AstraReviewRiskTests(unittest.TestCase):
+    def test_a_long_command_is_judged_whole_and_flagged_for_the_mac(self):
+        command = "printf '" + "x" * 2100 + "'; rm -rf build"
+        output = json.loads(hook.night_output("Bash", {"command": command}))
+        self.assertEqual("deny", output["hookSpecificOutput"]["permissionDecision"])
+        event = hook.build_event({"session_id": "s", "hook_event_name": "PreToolUse", "tool_name": "Bash",
+                                  "tool_input": {"command": command}}, "claude")
+        self.assertTrue(event["inputClipped"])
+        short = hook.build_event({"session_id": "s", "hook_event_name": "PreToolUse", "tool_name": "Bash",
+                                  "tool_input": {"command": "ls"}}, "claude")
+        self.assertNotIn("inputClipped", short)
+
+    def test_every_file_of_a_patch_counts(self):
+        patch = "*** Begin Patch\n*** Update File: src/public.txt\n+b\n*** Add File: .env\n+KEY=1\n*** End Patch"
+        self.assertEqual(2, hook.risk_level("apply_patch", {"input": patch}))
+        self.assertEqual(0, hook.risk_level("apply_patch", {"input": "*** Update File: src/a.txt\n*** Add File: b.txt"}))
 
 
 if __name__ == "__main__":

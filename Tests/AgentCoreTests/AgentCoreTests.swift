@@ -1523,7 +1523,7 @@ final class OfficeTests: XCTestCase {
         XCTAssertTrue(workdir.hasSuffix("/web"))
         try "b".write(toFile: workdir + "/b.txt", atomically: true, encoding: .utf8)
         XCTAssertFalse(FileManager.default.fileExists(atPath: repo + "/web/b.txt"))  // the project is untouched
-        XCTAssertTrue(OfficeWorkspace.commitLeftovers(item))
+        XCTAssertNil(OfficeWorkspace.commitLeftovers(item))
         XCTAssertNil(OfficeWorkspace.accept(item))
         XCTAssertTrue(FileManager.default.fileExists(atPath: repo + "/web/b.txt"))
         XCTAssertFalse(FileManager.default.fileExists(atPath: workdir))
@@ -1694,5 +1694,182 @@ final class CodexHooksLayoutTests: XCTestCase {
         XCTAssertEqual((table["PreToolUse"] as? [Any])?.count, 2)  // the user's own hook is kept
         XCTAssertFalse(HookInstaller.isOutdated(config: fixed, agent: .codex))
         XCTAssertEqual(Set(HookInstaller.removed(config: fixed, agent: .codex).keys), ["hooks", "description"])
+    }
+}
+
+final class ReviewOutsideGitTests: XCTestCase {
+    func testFilesOutsideGitAreReviewedAsTheyAre() throws {
+        let folder = FileManager.default.temporaryDirectory.appendingPathComponent("plain-\(UUID().uuidString)").path
+        try FileManager.default.createDirectory(atPath: folder, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(atPath: folder) }
+        try "# Plan\nstep one\n".write(toFile: folder + "/plan.md", atomically: true, encoding: .utf8)
+        let text = try XCTUnwrap(CrossReview.diff(cwd: folder, files: [folder + "/plan.md"]))
+        XCTAssertTrue(text.contains("outside git") && text.contains("step one"))
+        XCTAssertNil(CrossReview.diff(cwd: folder, files: []))
+    }
+}
+
+final class FinishedMessageTests: XCTestCase {
+    func testTheDoneMessageSaysWhatWasAskedAndDone() {
+        let text = PhoneReplies.finishedMessage(
+            head: "✅ Claude Code · shop · 16 min", task: "Add a contact form", summary: "Added the form and a test.",
+            files: ["/p/a.swift", "/p/b.swift", "/p/c.swift", "/p/d.swift"],
+            taskLabel: { "Task: " + $0 }, filesLabel: { "Files: \($0) (\($1))" })
+        XCTAssertEqual(text, "✅ Claude Code · shop · 16 min\nTask: Add a contact form\n\nAdded the form and a test.\n\nFiles: 4 (b.swift, c.swift, d.swift, …)")
+        XCTAssertEqual(PhoneReplies.finishedMessage(head: "✅", task: nil, summary: "  ", files: [],
+                                                    taskLabel: { $0 }, filesLabel: { _, n in n }), "✅")
+    }
+
+    func testALongSummaryIsCutAtALineOrSentence() {
+        let long = String(repeating: "Sentence one is here. ", count: 80)
+        let cut = PhoneReplies.excerpt(long, limit: 100) ?? ""
+        XCTAssertTrue(cut.hasSuffix(". …"))
+        XCTAssertLessThanOrEqual(cut.count, 104)
+    }
+}
+
+final class AstraReviewRiskTests: XCTestCase {
+    // A3: the notch copy of a long command is shortened; the decision must read all of it.
+    func testLongCommandMustBeAssessedBeforeDisplayClipping() throws {
+        let command = "printf '" + String(repeating: "x", count: 2100) + "'; rm -rf build"
+        let payload = try JSONSerialization.data(withJSONObject: [
+            "session_id": "s", "hook_event_name": "PreToolUse", "tool_name": "Bash", "tool_input": ["command": command]])
+        let event = try HookEvent.parse(payload, agent: .claude)
+        XCTAssertEqual(event.inputClipped, true)
+        let full = RiskRadar.assess(toolName: "Bash", toolInput: HookEvent.fullToolInput(payload))
+        XCTAssertGreaterThanOrEqual(full.level, .danger)
+        XCTAssertEqual(NightShift.decision(for: full), .deny)
+        // Whoever only has the shortened copy (a remote approval) must not call it safe either.
+        let shortened = RiskRadar.assess(toolName: "Bash", toolInput: event.toolInput, clipped: event.inputClipped == true)
+        XCTAssertEqual(NightShift.decision(for: shortened), .deny)
+        let short = try HookEvent.parse(JSONSerialization.data(withJSONObject: [
+            "session_id": "s", "hook_event_name": "PreToolUse", "tool_name": "Bash", "tool_input": ["command": "ls"]]), agent: .claude)
+        XCTAssertNil(short.inputClipped)
+    }
+
+    // A4: one patch, a harmless file first and .env second.
+    func testPatchMustAssessEveryChangedPath() {
+        let patch = "*** Begin Patch\n*** Update File: src/public.txt\n@@\n-a\n+b\n*** Add File: .env\n+KEY=1\n*** End Patch"
+        XCTAssertEqual(RiskRadar.assess(toolName: "apply_patch", toolInput: ["input": .string(patch)]).level, .danger)
+        let moved = "*** Begin Patch\n*** Update File: notes.txt\n*** Move to: ~/.ssh/config\n*** End Patch"
+        XCTAssertEqual(RiskRadar.assess(toolName: "apply_patch", toolInput: ["input": .string(moved)]).level, .danger)
+        let harmless = "*** Begin Patch\n*** Update File: src/a.txt\n*** Add File: src/b.txt\n*** End Patch"
+        XCTAssertEqual(RiskRadar.assess(toolName: "apply_patch", toolInput: ["input": .string(harmless)]).level, .safe)
+    }
+}
+
+final class AstraReviewSafetyNetTests: XCTestCase {
+    // A6: src is tracked, src/settings.local is ignored; deleting src must keep both.
+    func testDirectoryDeletionSnapshotMustIncludeIgnoredChildren() throws {
+        // An ordinary path under the home folder: /var aliases on a Mac could hide the bug.
+        let home = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".denny-test-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: home) }
+        let repo = home.appendingPathComponent("app").path
+        try FileManager.default.createDirectory(atPath: repo + "/src", withIntermediateDirectories: true)
+        try "code\n".write(toFile: repo + "/src/code.txt", atomically: true, encoding: .utf8)
+        try "settings.local\n".write(toFile: repo + "/.gitignore", atomically: true, encoding: .utf8)
+        for args in [["init", "-q"], ["add", "-A"], ["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "first"]] {
+            XCTAssertNotNil(SafetyNet.git(repo, args))
+        }
+        try "token=local\n".write(toFile: repo + "/src/settings.local", atomically: true, encoding: .utf8)
+        let snapshot = try XCTUnwrap(SafetyNet.take(command: "rm -rf src", cwd: repo, agent: "claude", home: home))
+        XCTAssertEqual(snapshot.copies.map(\.original), [repo + "/src/settings.local"])
+        try FileManager.default.removeItem(atPath: repo + "/src")
+        _ = SafetyNet.restore(snapshot, home: home)
+        XCTAssertEqual(try String(contentsOfFile: repo + "/src/code.txt", encoding: .utf8), "code\n")
+        XCTAssertEqual(try String(contentsOfFile: repo + "/src/settings.local", encoding: .utf8), "token=local\n")
+    }
+}
+
+final class AstraReviewOfficeTests: XCTestCase {
+    private var home: URL!
+    private var repo: String!
+
+    override func setUpWithError() throws {
+        home = FileManager.default.temporaryDirectory.appendingPathComponent("office-\(UUID().uuidString)")
+        repo = home.appendingPathComponent("project").path
+        try FileManager.default.createDirectory(atPath: repo, withIntermediateDirectories: true)
+        try "a\n".write(toFile: repo + "/a.txt", atomically: true, encoding: .utf8)
+        for args in [["init", "-q", "-b", "main"], ["config", "user.email", "t@t"], ["config", "user.name", "T"],
+                     ["add", "-A"], ["commit", "-qm", "init"]] {
+            XCTAssertEqual(OfficeWorkspace.git(["-C", repo] + args).status, 0)
+        }
+    }
+
+    override func tearDown() { try? FileManager.default.removeItem(at: home) }
+
+    // A1: git can't commit the agent's work -> accept must refuse and keep it.
+    func testCommitFailureMustKeepUncommittedAgentWork() throws {
+        let task = OfficeWorkspace.prepare(OfficeTask(prompt: "go", agent: .claude, folder: repo), home: home).task
+        let workdir = try XCTUnwrap(task.workdir)
+        try "work\n".write(toFile: workdir + "/b.txt", atomically: true, encoding: .utf8)
+        for args in [["config", "user.useConfigOnly", "true"], ["config", "user.name", ""], ["config", "user.email", ""]] {
+            _ = OfficeWorkspace.git(["-C", repo] + args)
+        }
+        XCTAssertNotNil(OfficeWorkspace.commitLeftovers(task))
+        XCTAssertNotNil(OfficeWorkspace.accept(task))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: workdir + "/b.txt"))
+    }
+
+    // A2: the user is resolving a merge by hand; accepting a task must not abort it.
+    func testAcceptMustNotAbortUsersExistingMerge() throws {
+        let task = OfficeWorkspace.prepare(OfficeTask(prompt: "go", agent: .claude, folder: repo), home: home).task
+        try "task\n".write(toFile: try XCTUnwrap(task.workdir) + "/c.txt", atomically: true, encoding: .utf8)
+        XCTAssertNil(OfficeWorkspace.commitLeftovers(task))
+        let git = { (args: [String]) in OfficeWorkspace.git(["-C", self.repo] + args) }
+        _ = git(["checkout", "-q", "-b", "side"])
+        try "side\n".write(toFile: repo + "/a.txt", atomically: true, encoding: .utf8)
+        _ = git(["commit", "-qam", "side"])
+        _ = git(["checkout", "-q", "main"])
+        try "main\n".write(toFile: repo + "/a.txt", atomically: true, encoding: .utf8)
+        _ = git(["commit", "-qam", "main"])
+        _ = git(["merge", "side"])
+        try "resolved by hand\n".write(toFile: repo + "/a.txt", atomically: true, encoding: .utf8)
+        _ = git(["add", "a.txt"])
+        XCTAssertNotNil(OfficeWorkspace.accept(task))
+        XCTAssertEqual(git(["rev-parse", "-q", "--verify", "MERGE_HEAD"]).status, 0)
+        XCTAssertEqual(try String(contentsOfFile: repo + "/a.txt", encoding: .utf8), "resolved by hand\n")
+    }
+}
+
+final class AstraReviewReworkTests: XCTestCase {
+    // A7: without a session the server starts over, so it needs the task itself.
+    func testRemoteReworkWithoutSessionMustRetainOriginalTask() {
+        let task = OfficeTask(prompt: "Add the contact form", agent: .codex, folder: "/srv/app", host: "srv")
+        let job = Office.remoteRework(task, remarks: "add validation", settings: OfficeSettings())
+        XCTAssertNil(job.resume)
+        XCTAssertTrue(job.prompt?.hasPrefix("Add the contact form") == true)
+        XCTAssertTrue(job.prompt?.hasSuffix("add validation") == true)
+        var withSession = task
+        withSession.sessionId = "abc-1"
+        XCTAssertFalse(Office.remoteRework(withSession, remarks: "add validation", settings: OfficeSettings())
+            .prompt?.contains("Add the contact form") == true)
+    }
+
+    func testTheServerTellsTheSession() {
+        var task = OfficeTask(prompt: "go", agent: .codex, folder: "/srv/app", host: "srv")
+        var result = RemoteJobResult(id: "r", kind: .office, state: "review")
+        result.task = task.id
+        result.session = "019f-abc"
+        XCTAssertTrue(Office.apply(result, to: &task))
+        XCTAssertEqual(task.sessionId, "019f-abc")
+    }
+}
+
+final class AstraReviewQueueTests: XCTestCase {
+    // A9: a rework waits in the same queue: one task per folder, a couple at a time.
+    func testAReworkWaitsLikeANewTask() {
+        func task(_ folder: String, _ seconds: Double, _ state: OfficeTask.State) -> OfficeTask {
+            var task = OfficeTask(prompt: folder, agent: .claude, folder: folder, createdAt: Date(timeIntervalSince1970: seconds))
+            task.state = state
+            return task
+        }
+        var rework = task("/a", 1, .queued)
+        rework.rework = "add tests"
+        let working = task("/a", 2, .working(since: Date()))
+        XCTAssertEqual(Office.startable([rework, working]), [])  // its folder is busy
+        let two = [task("/b", 3, .working(since: Date())), task("/c", 4, .working(since: Date()))]
+        XCTAssertEqual(Office.startable([rework] + two), [])  // two already running
+        XCTAssertEqual(Office.startable([rework]).map(\.rework), ["add tests"])
     }
 }

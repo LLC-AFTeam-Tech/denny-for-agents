@@ -254,6 +254,8 @@ extension Translations {
         "phone.denied": "❌ 拒否しました",
         "phone.expired": "⌛ ここでは応答なし — エージェントは自分のターミナルで確認します。",
         "phone.replyHint": "↩️ このメッセージに返信して、エージェントに次にやることを伝えましょう。",
+        "phone.finishedTask": "📝 タスク：%@",
+        "phone.finishedFiles": "📄 変更したファイル：%1$ld（%2$@）",
         "phone.replyUnknown": "✅ 完了メッセージに返信すると、そのエージェントに次にやることを伝えられます。",
         "phone.replyLive": "%@ が返信を受け取り、ターミナルで続けています。",
         "phone.replyBackground": "%1$@ が %2$@ でバックグラウンドで続けます（慎重モード：あなたなしで危険なことはしません）。終わったら Telegram で知らせます。",
@@ -433,6 +435,7 @@ extension Translations {
         "risk.reason.network": "ネットワークにアクセスします。",
         "risk.reason.gitHistory": "git の履歴を書き換えるか、ファイルの変更を取り消します。",
         "risk.reason.sensitiveFile": "重要なファイルを変更します: %@。",
+        "risk.reason.clipped": "リクエストが長すぎて全体を確認できません — 危険として扱います。",
         "risk.reason.externalTool": "外部ツール（MCP サーバー）を使います。",
 
         "load.thisMac": "この Mac",

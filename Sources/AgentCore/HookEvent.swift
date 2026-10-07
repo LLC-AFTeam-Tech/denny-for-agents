@@ -58,6 +58,9 @@ public struct HookEvent: Codable, Equatable, Sendable {
     public var turnUsage: [UsageReport.Item]?
     /// Set when a night-shift job started this agent: nobody is watching.
     public var nightShift: String?
+    /// The tool input was too long and is shortened here: whoever judges the
+    /// risk from this copy can't see all of it.
+    public var inputClipped: Bool?
 
     public init(
         agent: AgentKind,
@@ -121,10 +124,12 @@ public struct HookEvent: Codable, Equatable, Sendable {
             throw ParseError.missingSessionId
         }
         var toolInput: [String: JSONValue]?
+        var inputClipped = false
         if case .object(let object)? = raw.tool_input {
             toolInput = object.mapValues(clipped)
+            inputClipped = toolInput != object
         }
-        return HookEvent(
+        var event = HookEvent(
             agent: agent,
             name: raw.hook_event_name.flatMap(HookEventName.init(rawValue:)) ?? .other,
             sessionId: sessionId,
@@ -136,6 +141,16 @@ public struct HookEvent: Codable, Equatable, Sendable {
             notificationType: raw.notification_type,
             lastAssistantMessage: raw.last_assistant_message.map(clip)
         )
+        if inputClipped { event.inputClipped = true }
+        return event
+    }
+
+    /// The tool input exactly as the agent sent it. The event's own copy is
+    /// shortened for showing; decisions must read this one.
+    public static func fullToolInput(_ data: Data) -> [String: JSONValue]? {
+        guard let raw = try? JSONDecoder().decode(RawPayload.self, from: data),
+              case .object(let object)? = raw.tool_input else { return nil }
+        return object
     }
 
     static func clip(_ text: String) -> String {

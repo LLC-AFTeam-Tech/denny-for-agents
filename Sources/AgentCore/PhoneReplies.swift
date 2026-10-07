@@ -56,6 +56,29 @@ public enum PhoneReplies {
         }
     }
 
+    /// Short enough for a phone: whole lines while they fit, then "…".
+    public static func excerpt(_ text: String?, limit: Int) -> String? {
+        guard let text = text?.trimmingCharacters(in: .whitespacesAndNewlines), !text.isEmpty else { return nil }
+        guard text.count > limit else { return text }
+        let cut = String(text.prefix(limit))
+        let end = cut.lastIndex(where: { $0 == "\n" || $0 == "." }).map { cut[...$0] } ?? Substring(cut)
+        return String(end.count > limit / 2 ? end : Substring(cut)).trimmingCharacters(in: .whitespacesAndNewlines) + " …"
+    }
+
+    /// The "done" message: what was asked, what the agent says it did, which
+    /// files changed — so a reply can say what to do next.
+    public static func finishedMessage(head: String, task: String?, summary: String?, files: [String],
+                                       taskLabel: (String) -> String, filesLabel: (Int, String) -> String) -> String {
+        var lines = [head]
+        if let task = excerpt(task, limit: 200) { lines.append(taskLabel(task)) }
+        if let summary = excerpt(summary, limit: 900) { lines += ["", summary] }
+        if !files.isEmpty {
+            let names = files.suffix(3).map { ($0 as NSString).lastPathComponent }.joined(separator: ", ")
+            lines += ["", filesLabel(files.count, names + (files.count > 3 ? ", …" : ""))]
+        }
+        return lines.joined(separator: "\n")
+    }
+
     public static func clean(_ text: String) -> String {
         String(text.trimmingCharacters(in: .whitespacesAndNewlines).prefix(maxLength))
     }

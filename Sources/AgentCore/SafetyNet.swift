@@ -233,11 +233,19 @@ public enum SafetyNet {
         var copies: [SafetyCopy] = [], skipped: [String] = []
         var copied: Int64 = 0
         let homePath = home.path
+        var paths: [String] = []
         for path in expand(targets, cwd: cwd) {
             if let repo, ref != nil, (path + "/").hasPrefix(repo.hasSuffix("/") ? repo : repo + "/"),
                git(repo, ["check-ignore", "-q", path]) == nil {
-                continue  // tracked or untracked-but-not-ignored: already in the git snapshot
+                // Tracked or untracked-but-not-ignored: already in the git snapshot.
+                // Not so the ignored files inside a folder (local settings, .env):
+                // those are copied one by one, or listed as skipped.
+                paths += ignoredInside(path, repo: repo)
+                continue
             }
+            paths.append(path)
+        }
+        for path in paths {
             if path == "/" || path == homePath {
                 skipped.append(path)
                 continue
@@ -274,6 +282,24 @@ public enum SafetyNet {
         index.append(snapshot)
         save(Array(index.suffix(keep)), home: home, dropping: Array(index.dropLast(keep)))
         return snapshot
+    }
+
+    /// Ignored files and folders under `path` (a folder git snapshots only
+    /// partly), as absolute paths; an ignored folder comes as one entry.
+    static func ignoredInside(_ path: String, repo: String) -> [String] {
+        var isDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: path, isDirectory: &isDirectory), isDirectory.boolValue,
+              let listed = git(repo, ["ls-files", "-z", "--others", "--ignored", "--exclude-standard", "--directory", "--", path],
+                               trim: false) else {
+            return []
+        }
+        // -z: names exactly as they are. Without it git quotes and escapes
+        // non-ASCII names ("настройки.local"), tabs and newlines.
+        return listed.split(separator: "\0").map { name in
+            var relative = String(name)
+            if relative.hasSuffix("/") { relative.removeLast() }
+            return (repo as NSString).appendingPathComponent(relative)
+        }
     }
 
     private static func gitSnapshot(repo: String, id: String, message: String, folder: URL) -> String? {
@@ -466,7 +492,8 @@ public enum SafetyNet {
     // MARK: - git
 
     @discardableResult
-    static func git(_ directory: String, _ args: [String], env: [String: String] = [:], timeout: TimeInterval = 60) -> String? {
+    static func git(_ directory: String, _ args: [String], env: [String: String] = [:], timeout: TimeInterval = 60,
+                    trim: Bool = true) -> String? {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
         process.arguments = ["git", "-C", directory] + args
@@ -482,7 +509,8 @@ public enum SafetyNet {
         process.waitUntilExit()
         timer.cancel()
         guard process.terminationStatus == 0 else { return nil }
-        return String(decoding: data, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
+        let text = String(decoding: data, as: UTF8.self)
+        return trim ? text.trimmingCharacters(in: .whitespacesAndNewlines) : text
     }
 }
 

@@ -16,6 +16,9 @@ final class SSHTunnelManager {
     }
 
     var onReport: ((UsageReport) -> Void)?
+    /// A connected server told its name (on connect and every few minutes):
+    /// the app wakes its worker if jobs are waiting for it. Main thread.
+    var onHostConnected: ((String) -> Void)?
     /// For the settings window; main thread.
     var onChange: () -> Void = {}
     private(set) var servers: [SSHServer] = SSHTunnelManager.load()
@@ -240,6 +243,7 @@ final class SSHTunnelManager {
                   let report = try? JSONDecoder().decode(UsageReport.self, from: Data(line.utf8)) else { return }
             self?.hostNames[report.host] = server.id
             self?.onReport?(report)
+            self?.onHostConnected?(report.host)
         }
     }
 

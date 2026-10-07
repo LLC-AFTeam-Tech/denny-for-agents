@@ -249,7 +249,7 @@ public struct AgentStore: Equatable, Sendable {
                 summary: summary,
                 detail: Self.approvalDetail(event),
                 receivedAt: now,
-                risk: RiskRadar.assess(toolName: event.toolName, toolInput: event.toolInput)
+                risk: RiskRadar.assess(toolName: event.toolName, toolInput: event.toolInput, clipped: event.inputClipped == true)
             ))
             effects.append(.needsAttention(approvalId: requestId))
         case .notification:

@@ -95,10 +95,12 @@ final class OfficeRunner {
             sendRemote(Office.remoteRework(task, remarks: text, settings: settings), host)
             return
         }
-        update(id) { $0.state = .working(since: Date()) }
-        if let ready = self.task(id) {
-            launch(ready, arguments: Office.reworkArguments(ready, remarks: text, settings: settings))
+        // Through the queue like a new task: one per folder, a couple at a time.
+        update(id) {
+            $0.state = .queued
+            $0.rework = text
         }
+        tick()
     }
 
     /// A queued task is dropped, a running one stopped (its work kept for review).
@@ -115,6 +117,12 @@ final class OfficeRunner {
             return
         }
         switch task.state {
+        case .queued where task.rework != nil:
+            // A rework waiting its turn: back to review, the work is kept.
+            update(id) {
+                $0.state = .review(at: Date())
+                $0.rework = nil
+            }
         case .queued:
             tasks.removeAll { $0.id == id }
             changed()
@@ -211,6 +219,17 @@ final class OfficeRunner {
     // MARK: - Running on this Mac
 
     private func start(_ task: OfficeTask) {
+        if let remarks = task.rework {
+            // A rework: same working copy, same session.
+            update(task.id) {
+                $0.state = .working(since: Date())
+                $0.rework = nil
+            }
+            if let ready = self.task(task.id) {
+                launch(ready, arguments: Office.reworkArguments(ready, remarks: remarks, settings: settings))
+            }
+            return
+        }
         update(task.id) { $0.state = .working(since: Date()) }
         DispatchQueue.global(qos: .userInitiated).async {
             let prepared = OfficeWorkspace.prepare(task)
@@ -256,7 +275,7 @@ final class OfficeRunner {
             let stopped = finished.terminationReason == .uncaughtSignal
             // Whatever the agent left, committed on its branch; then what
             // changed, the tests and (if asked) the other agent's review.
-            OfficeWorkspace.commitLeftovers(task)
+            let commitError = OfficeWorkspace.commitLeftovers(task)
             let numstat = OfficeWorkspace.changes(task)
             let tests = ok ? Self.runTests(task.runFolder) : nil
             let second = ok && review ? self?.secondOpinion(task) : nil
@@ -278,7 +297,10 @@ final class OfficeRunner {
                 }
                 let reason = overBudget ? L.officeOverBudget : stopped ? L.officeStopped
                     : Office.failureReason(log: try? String(contentsOf: log, encoding: .utf8), status: finished.terminationStatus)
-                self.finish(task.id, state: ok ? .review(at: Date()) : .failed(at: Date(), reason: reason))
+                // The work stays in the working copy; the card says why it isn't on the branch.
+                let state: OfficeTask.State = commitError.map { .failed(at: Date(), reason: "git commit: " + $0) }
+                    ?? (ok ? .review(at: Date()) : .failed(at: Date(), reason: reason))
+                self.finish(task.id, state: state)
                 if let done = self.task(task.id) { self.onReport(done) }
             }
         }

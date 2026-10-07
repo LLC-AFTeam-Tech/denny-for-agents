@@ -72,6 +72,12 @@ final class AgentsController {
         server.onReplyOffered = { [weak self] event, id in self?.holdForReply(event, id: id) ?? false }
         telegram.start()
         office.sendRemote = { [weak self] job, host in self?.queue(job, host: host) }
+        // Jobs queued while a server was out of reach (or kept over an app
+        // restart) wait for its worker: start it once the server is back.
+        ssh.onHostConnected = { [weak self] host in
+            guard let self, self.remoteJobs[host]?.isEmpty == false else { return }
+            self.ssh.wakeWorker(host: host)
+        }
         office.limits = { [weak self] in self?.model.summary.limits ?? [:] }
         office.onReport = { [weak self] task in self?.reportOffice(task) }
         office.onAcceptFailed = { [weak self] task, error in self?.officeAcceptFailed(task, error: error) }
@@ -242,9 +248,12 @@ final class AgentsController {
                 if telegram.settings.sendFinished, !officeSession, let session = store.sessions[key] {
                     let task = session.cwd.map { PhoneReplies.Task(agent: session.agent, sessionId: session.sessionId,
                                                                    folder: $0, host: session.host) }
-                    telegram.sendFinished("✅ " + L.finishedTitle(session.agent) + " · "
-                                          + (duration.map { L.finishedBody(session.projectName, Fmt.countdown($0)) } ?? session.projectName),
-                                          task: task.flatMap { PhoneReplies.isValidSession($0.sessionId) ? $0 : nil })
+                    let head = "✅ " + L.finishedTitle(session.agent) + " · "
+                        + (duration.map { L.finishedBody(session.projectName, Fmt.countdown($0)) } ?? session.projectName)
+                    let text = PhoneReplies.finishedMessage(head: head, task: session.lastPrompt, summary: session.lastMessage,
+                                                            files: session.turnFiles, taskLabel: L.phoneFinishedTask,
+                                                            filesLabel: L.phoneFinishedFiles)
+                    telegram.sendFinished(text, task: task.flatMap { PhoneReplies.isValidSession($0.sessionId) ? $0 : nil })
                 }
                 if !settings.isQuiet, notifier.settings.notifiesFinish(after: duration), let session = store.sessions[key] {
                     notifier.post(title: L.finishedTitle(session.agent),
@@ -903,7 +912,9 @@ final class AgentsController {
                 model.review?.state = .done(text: text, findings: findings)
                 react(findings == 0 ? .joy : .idea)
             } else {
-                model.review?.state = .failed(result.output ?? "—")
+                // The server's reasons come in English: the known one in the user's language.
+                let reason = result.output == "no changes to review" ? L.reviewNoChanges : (result.output ?? "—")
+                model.review?.state = .failed(reason)
             }
         case .lines:
             guard let receiptId, model.receipt?.id == receiptId, result.state == "done" else { return }

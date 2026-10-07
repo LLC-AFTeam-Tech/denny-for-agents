@@ -14,8 +14,10 @@ public enum CrossReview {
     }
 
     /// The diff of the task's files against the last commit, new files in full.
+    /// Outside git there's nothing to diff against: the files as they are now.
     public static func diff(cwd: String, files: [String]) -> String? {
-        guard !files.isEmpty, let repo = SafetyNet.git(cwd, ["rev-parse", "--show-toplevel"]) else { return nil }
+        guard !files.isEmpty else { return nil }
+        guard let repo = SafetyNet.git(cwd, ["rev-parse", "--show-toplevel"]) else { return wholeFiles(files, cwd: cwd) }
         var text = SafetyNet.git(repo, ["diff", "HEAD", "--"] + files) ?? ""
         let untracked = SafetyNet.git(repo, ["ls-files", "--others", "--exclude-standard", "--full-name", "--"] + files) ?? ""
         for name in untracked.split(separator: "\n").map(String.init) where !name.isEmpty {
@@ -26,6 +28,21 @@ public enum CrossReview {
         text = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty else { return nil }
         if text.count > maxDiff { text = String(text.prefix(maxDiff)) + "\n\n[diff cut here: too long]" }
+        return text
+    }
+
+    static func wholeFiles(_ files: [String], cwd: String) -> String? {
+        var text = ""
+        for file in files {
+            let path = file.hasPrefix("/") ? file : (cwd as NSString).appendingPathComponent(file)
+            guard let attributes = try? FileManager.default.attributesOfItem(atPath: path),
+                  (attributes[.size] as? Int ?? 0) < 2 << 20,
+                  let content = try? String(contentsOfFile: path, encoding: .utf8) else { continue }
+            text += "\n\nFile \(file) (outside git, as it is now):\n" + content
+        }
+        text = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty else { return nil }
+        if text.count > maxDiff { text = String(text.prefix(maxDiff)) + "\n\n[cut here: too long]" }
         return text
     }
 
@@ -42,7 +59,7 @@ public enum CrossReview {
         each with the file and line. If everything looks right, reply with one line saying so and nothing else. \
         Write the review in the same language as the task description.
 
-        The changes (git diff against the last commit):
+        The changes (a git diff against the last commit; files outside git are shown in full, as they are now):
 
         \(diff)
         """

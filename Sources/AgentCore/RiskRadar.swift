@@ -77,18 +77,22 @@ public enum RiskRadar {
         options: []
     )
 
-    public static func assess(toolName: String?, toolInput: [String: JSONValue]?) -> RiskAssessment {
+    /// `clipped`: the input was shortened before it got here (a long remote
+    /// command): what can't be seen can't be called safe.
+    public static func assess(toolName: String?, toolInput: [String: JSONValue]?, clipped: Bool = false) -> RiskAssessment {
         let input = toolInput ?? [:]
         var reasons: [(RiskLevel, RiskReason)] = []
+        if clipped { reasons.append((.danger, RiskReason(key: "clipped", detail: nil))) }
 
         if let command = StepDescriber.command(from: input) {
             reasons += assess(command: command)
         }
         switch StepDescriber.kind(toolName: toolName) {
         case .writing:
-            let path = input["file_path"]?.stringValue ?? input["path"]?.stringValue ?? input["notebook_path"]?.stringValue
-                ?? patchedPath(input)
-            if let path, isSensitive(path) {
+            // A patch can touch many files: every one counts, not just the first.
+            let paths = [input["file_path"]?.stringValue, input["path"]?.stringValue, input["notebook_path"]?.stringValue]
+                .compactMap { $0 } + patchedPaths(input)
+            if let path = paths.first(where: isSensitive) {
                 reasons.append((.danger, RiskReason(key: "sensitiveFile", detail: (path as NSString).lastPathComponent)))
             }
         default:
@@ -130,14 +134,15 @@ public enum RiskRadar {
         return sensitivePaths.firstMatch(in: expanded, range: range) != nil
     }
 
-    private static func patchedPath(_ input: [String: JSONValue]) -> String? {
-        let patch = input["input"]?.stringValue ?? input["patch"]?.stringValue
-        guard let patch else { return nil }
-        for marker in ["*** Update File: ", "*** Add File: ", "*** Delete File: "] {
-            if let range = patch.range(of: marker) {
-                return patch[range.upperBound...].split(separator: "\n").first.map(String.init)
-            }
+    /// Every file a patch adds, updates, deletes or moves to.
+    static func patchedPaths(_ input: [String: JSONValue]) -> [String] {
+        guard let patch = input["input"]?.stringValue ?? input["patch"]?.stringValue else { return [] }
+        let markers = ["*** Update File: ", "*** Add File: ", "*** Delete File: ", "*** Move to: "]
+        return patch.split(separator: "\n").compactMap { line in
+            let text = line.trimmingCharacters(in: .whitespaces)
+            guard let marker = markers.first(where: { text.hasPrefix($0) }) else { return nil }
+            let path = String(text.dropFirst(marker.count)).trimmingCharacters(in: .whitespaces)
+            return path.isEmpty ? nil : path
         }
-        return nil
     }
 }

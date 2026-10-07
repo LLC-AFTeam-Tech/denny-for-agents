@@ -32,7 +32,9 @@ if event.name == .stop {
 event.nightShift = ProcessInfo.processInfo.environment[NightShift.environmentKey]
 var nightOutput: String?
 if event.nightShift != nil, agent == .claude, event.name == .preToolUse {
-    let risk = RiskRadar.assess(toolName: event.toolName, toolInput: event.toolInput)
+    // The full command, not the copy shortened for the notch: "printf …(2000
+    // chars)…; rm -rf build" must not slip through on its hidden tail.
+    let risk = RiskRadar.assess(toolName: event.toolName, toolInput: HookEvent.fullToolInput(payload) ?? event.toolInput)
     nightOutput = NightShift.preToolUseOutput(NightShift.decision(for: risk), risk: risk)
 }
 func finish() -> Never {

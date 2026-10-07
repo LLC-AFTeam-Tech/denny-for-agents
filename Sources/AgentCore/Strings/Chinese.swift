@@ -254,6 +254,8 @@ extension Translations {
         "phone.denied": "❌ 已拒绝",
         "phone.expired": "⌛ 这里没有回应——智能体在自己的终端里询问。",
         "phone.replyHint": "↩️ 回复这条消息，告诉智能体接下来做什么。",
+        "phone.finishedTask": "📝 任务：%@",
+        "phone.finishedFiles": "📄 修改的文件：%1$ld（%2$@）",
         "phone.replyUnknown": "回复一条 ✅ 完成消息，告诉那个智能体接下来做什么。",
         "phone.replyLive": "%@ 已收到你的回复，在它的终端里继续。",
         "phone.replyBackground": "%1$@ 在后台于 %2$@ 继续（谨慎模式：没有你不做危险操作）。完成后 Telegram 会通知你。",
@@ -433,6 +435,7 @@ extension Translations {
         "risk.reason.network": "访问网络。",
         "risk.reason.gitHistory": "改写 git 历史或丢弃文件更改。",
         "risk.reason.sensitiveFile": "修改敏感文件：%@。",
+        "risk.reason.clipped": "请求太长，无法完整检查——按危险处理。",
         "risk.reason.externalTool": "使用外部工具（MCP 服务器）。",
 
         "load.thisMac": "这台 Mac",

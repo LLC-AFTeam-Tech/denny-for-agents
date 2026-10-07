@@ -254,6 +254,8 @@ extension Translations {
         "phone.denied": "❌ Refusé",
         "phone.expired": "⌛ Pas de réponse ici — l'agent demande dans son terminal.",
         "phone.replyHint": "↩️ Réponds à ce message pour dire à l'agent quoi faire ensuite.",
+        "phone.finishedTask": "📝 Tâche : %@",
+        "phone.finishedFiles": "📄 Fichiers modifiés : %1$ld (%2$@)",
         "phone.replyUnknown": "Réponds à un message ✅ terminé pour dire à cet agent quoi faire ensuite.",
         "phone.replyLive": "%@ a reçu ta réponse et continue dans son terminal.",
         "phone.replyBackground": "%1$@ continue en arrière-plan dans %2$@ (mode prudent : rien de dangereux sans toi). Telegram préviendra quand ce sera fini.",
@@ -433,6 +435,7 @@ extension Translations {
         "risk.reason.network": "Accède au réseau.",
         "risk.reason.gitHistory": "Réécrit l'historique git ou annule des modifications.",
         "risk.reason.sensitiveFile": "Modifie un fichier sensible : %@.",
+        "risk.reason.clipped": "La demande est trop longue pour être vérifiée en entier — traitée comme dangereuse.",
         "risk.reason.externalTool": "Utilise un outil externe (serveur MCP).",
 
         "load.thisMac": "Ce Mac",

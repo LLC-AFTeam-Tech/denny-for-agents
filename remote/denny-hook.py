@@ -166,6 +166,8 @@ def build_event(payload, agent):
     tool_input = payload.get("tool_input")
     if isinstance(tool_input, dict):
         event["toolInput"] = clip(tool_input)
+        if event["toolInput"] != tool_input:
+            event["inputClipped"] = True  # the Mac must not judge the risk from a shortened copy
     return event
 
 
@@ -672,13 +674,15 @@ def risky_command(command):
     return risky, targets
 
 
-def run_git(repo, args, env=None, timeout=60):
+def run_git(repo, args, env=None, timeout=60, strip=True):
     try:
         result = subprocess.run(["git", "-C", repo] + args, capture_output=True, text=True,
                                 timeout=timeout, env=env)
     except (OSError, subprocess.TimeoutExpired):
         return None
-    return result.stdout.strip() if result.returncode == 0 else None
+    if result.returncode != 0:
+        return None
+    return result.stdout.strip() if strip else result.stdout
 
 
 def git_snapshot(repo, snapshot_id, message):
@@ -759,10 +763,17 @@ def take_snapshot(command, cwd, agent, now=None):
     repo = run_git(cwd, ["rev-parse", "--show-toplevel"])
     ref = git_snapshot(repo, snapshot_id, "Denny safety net: " + short) if repo else None
     copies, skipped, copied = [], [], 0
+    paths = []
     for path in expand_targets(targets, cwd):
         inside_repo = ref and (path + os.sep).startswith(repo.rstrip(os.sep) + os.sep)
         if inside_repo and run_git(repo, ["check-ignore", "-q", path]) is None:
-            continue  # tracked or untracked-but-not-ignored: already in the git snapshot
+            # Tracked or untracked-but-not-ignored: already in the git snapshot.
+            # Not so the ignored files inside a folder (local settings, .env):
+            # those are copied one by one, or listed as skipped.
+            paths += ignored_inside(path, repo)
+            continue
+        paths.append(path)
+    for path in paths:
         if path in (os.sep, HOME):
             skipped.append(path)
             continue
@@ -796,6 +807,17 @@ def take_snapshot(command, cwd, agent, now=None):
         remove_snapshot(item)
     save_safety_index(index[-SAFETY_KEEP:])
     return snapshot
+
+
+def ignored_inside(path, repo):
+    """Ignored files and folders under `path`, absolute (mirrors SafetyNet.ignoredInside)."""
+    if not os.path.isdir(path) or os.path.islink(path):
+        return []
+    # -z: names exactly as they are; without it git quotes and escapes non-ASCII
+    # names ("настройки.local"), tabs and newlines.
+    listed = run_git(repo, ["ls-files", "-z", "--others", "--ignored", "--exclude-standard", "--directory", "--", path],
+                     strip=False) or ""
+    return [os.path.join(repo, name[:-1] if name.endswith("/") else name) for name in listed.split("\0") if name]
 
 
 def safety_settings():
@@ -999,10 +1021,26 @@ def risk_level(tool_name, tool_input):
             if rule_level > level and re.search(pattern, command, re.IGNORECASE):
                 level = rule_level
     if tool_name in WRITING_TOOLS and isinstance(tool_input, dict):
-        path = tool_input.get("file_path") or tool_input.get("path") or tool_input.get("notebook_path")
-        if isinstance(path, str) and re.search(SENSITIVE_PATH, os.path.expanduser(path)):
+        # A patch can touch many files: every one counts, not just the first.
+        paths = [tool_input.get(key) for key in ("file_path", "path", "notebook_path")] + patched_paths(tool_input)
+        if any(isinstance(path, str) and re.search(SENSITIVE_PATH, os.path.expanduser(path)) for path in paths):
             level = max(level, 2)
     return level
+
+
+def patched_paths(tool_input):
+    """Every file a patch adds, updates, deletes or moves to (mirrors RiskRadar.patchedPaths)."""
+    patch = tool_input.get("input") or tool_input.get("patch")
+    if not isinstance(patch, str):
+        return []
+    markers = ("*** Update File: ", "*** Add File: ", "*** Delete File: ", "*** Move to: ")
+    paths = []
+    for line in patch.splitlines():
+        line = line.strip()
+        for marker in markers:
+            if line.startswith(marker) and line[len(marker):].strip():
+                paths.append(line[len(marker):].strip())
+    return paths
 
 
 def night_output(tool_name, tool_input):
@@ -1112,10 +1150,31 @@ def job_tests(job):
             "duration": time.time() - started}
 
 
-def task_diff(cwd, files, limit=120000):
-    repo = run_git(cwd, ["rev-parse", "--show-toplevel"]) if os.path.isdir(cwd or "") else None
-    if not repo or not files:
+def whole_files(cwd, files, limit=120000):
+    """Outside git there's nothing to diff against: the files as they are now.
+    Mirrors CrossReview.wholeFiles."""
+    text = ""
+    for name in files:
+        path = name if os.path.isabs(name) else os.path.join(cwd or HOME, name)
+        try:
+            if os.path.getsize(path) >= 2 << 20:
+                continue
+            with open(path) as handle:
+                text += "\n\nFile %s (outside git, as it is now):\n%s" % (name, handle.read())
+        except (OSError, UnicodeDecodeError):
+            continue
+    text = text.strip()
+    if not text:
         return None
+    return text if len(text) <= limit else text[:limit] + "\n\n[cut here: too long]"
+
+
+def task_diff(cwd, files, limit=120000):
+    if not files:
+        return None
+    repo = run_git(cwd, ["rev-parse", "--show-toplevel"]) if os.path.isdir(cwd or "") else None
+    if not repo:
+        return whole_files(cwd, files, limit)
     text = run_git(repo, ["diff", "HEAD", "--"] + files) or ""
     for name in (run_git(repo, ["ls-files", "--others", "--exclude-standard", "--full-name", "--"] + files) or "").splitlines():
         try:
@@ -1140,7 +1199,8 @@ def review_prompt(author, task, diff):
             "Reply with a short list of concrete findings, most important first, one per line starting with \"- \", "
             "each with the file and line. If everything looks right, reply with one line saying so and nothing else. "
             "Write the review in the same language as the task description.\n\n"
-            "The changes (git diff against the last commit):\n\n%s") % (names.get(author, author), asked, diff)
+            "The changes (a git diff against the last commit; files outside git are shown in full, as they are now):"
+            "\n\n%s") % (names.get(author, author), asked, diff)
 
 
 def agent_binary(agent):
@@ -1237,6 +1297,26 @@ def add_result(result):
         results = load_json_list(RESULTS_PATH)
         results.append(result)
         save_json_list(RESULTS_PATH, results[-200:])
+
+
+# The test/review thread removes a finished job while the main loop adds the
+# ones just received: every read-modify-write of the queue goes through this
+# lock, or a stale write would erase a job the Mac already counts as delivered.
+QUEUE_LOCK = threading.Lock()
+
+
+def queue_add(jobs):
+    if not jobs:
+        return
+    with QUEUE_LOCK:
+        queue = load_json_list(QUEUE_PATH)
+        known = {item.get("id") for item in queue}
+        save_json_list(QUEUE_PATH, queue + [job for job in jobs if job.get("id") not in known])
+
+
+def queue_remove(job_id):
+    with QUEUE_LOCK:
+        save_json_list(QUEUE_PATH, [item for item in load_json_list(QUEUE_PATH) if item.get("id") != job_id])
 
 
 def drop_delivered_results(delivered):
@@ -1374,12 +1454,30 @@ def office_copy_root(task):
 
 
 def office_commit_leftovers(task):
+    """None when done (or nothing to commit); else what git said -- the work is
+    then only in the working copy, which must be kept. Mirrors commitLeftovers."""
     copy = office_copy_root(task)
-    if not copy or office_git(["-C", copy, "add", "-A"])[0] != 0:
-        return
-    if office_git(["-C", copy, "diff", "--cached", "--quiet"])[0] == 1:
-        office_git(["-C", copy, "-c", "commit.gpgsign=false", "commit", "-q", "--no-verify",
-                    "-m", "%s: %s" % ("Codex" if task.get("agent") == "codex" else "Claude Code", office_title(task))])
+    if not copy:
+        return None
+    code, out = office_git(["-C", copy, "add", "-A"])
+    if code != 0:
+        return out or "git add"
+    if office_git(["-C", copy, "diff", "--cached", "--quiet"])[0] != 1:
+        return None
+    code, out = office_git(["-C", copy, "-c", "commit.gpgsign=false", "commit", "-q", "--no-verify",
+                            "-m", "%s: %s" % ("Codex" if task.get("agent") == "codex" else "Claude Code", office_title(task))])
+    return None if code == 0 else (out or "git commit")
+
+
+def office_unfinished_operation(repo):
+    """A merge/rebase/cherry-pick/revert the user hasn't finished: nothing may be
+    merged into the project then, and nothing aborted."""
+    for marker, name in (("MERGE_HEAD", "merge"), ("rebase-merge", "rebase"), ("rebase-apply", "rebase"),
+                         ("CHERRY_PICK_HEAD", "cherry-pick"), ("REVERT_HEAD", "revert")):
+        code, path = office_git(["-C", repo, "rev-parse", "--git-path", marker])
+        if code == 0 and path and os.path.exists(path if os.path.isabs(path) else os.path.join(repo, path)):
+            return name
+    return None
 
 
 def office_title(task):
@@ -1479,7 +1577,8 @@ def office_failure_reason(task, code):
 
 
 def office_result(task, state, **extra):
-    result = {"id": str(uuid.uuid4()), "kind": "office", "task": task["id"], "state": state}
+    result = {"id": str(uuid.uuid4()), "kind": "office", "task": task["id"], "state": state,
+              "session": office_session(task["id"])}  # the Mac may have missed the agent's events
     result.update({key: value for key, value in extra.items() if value is not None})
     add_result(result)
 
@@ -1487,9 +1586,12 @@ def office_result(task, state, **extra):
 def office_finish(task, code, stopped_reason=None):
     """After the agent exits (blocking: tests and review can take minutes).
     Reports and returns the new state."""
-    office_commit_leftovers(task)
+    commit_error = office_commit_leftovers(task)
     files, added, removed = office_changes(task)
     extra = {"files": files, "added": added, "removed": removed}
+    if commit_error:  # the work stays in the working copy; say why it isn't on the branch
+        office_result(task, "failed", output="git commit: " + commit_error[:500], **extra)
+        return "failed"
     if code == 0:
         extra.update(office_tests(task.get("workdir") or task.get("cwd")) or {})
         if task.get("review"):
@@ -1556,12 +1658,22 @@ def office_decide(task, accept):
         return
     copy = office_copy_root(task)
     if accept:
-        office_commit_leftovers(task)
+        # The agent's last changes must be on the branch first: otherwise the merge
+        # says "up to date" and removing the copy would lose them.
+        error = office_commit_leftovers(task)
+        if error:
+            office_result(task, "acceptFailed", output=("git commit: " + error)[:1000])
+            return
+        operation = office_unfinished_operation(repo)
+        if operation:
+            office_result(task, "acceptFailed", output="the project has an unfinished git %s: finish it first" % operation)
+            return
         code, out = office_git(["-C", repo, "-c", "commit.gpgsign=false", "merge", "--no-ff",
                                 "-m", "%s: %s" % ("Codex" if task.get("agent") == "codex" else "Claude Code",
                                                   office_title(task)), branch])
         if code != 0:
-            office_git(["-C", repo, "merge", "--abort"])
+            if office_unfinished_operation(repo) == "merge":  # only the merge this call started
+                office_git(["-C", repo, "merge", "--abort"])
             office_result(task, "acceptFailed", output=(out or "git merge")[:1000])
             return
     if copy:
@@ -1635,7 +1747,12 @@ def office_take(job, office, running):
     if task is None:
         return
     if kind == "officeRework" and task.get("state") in ("review", "failed"):
-        task["rework"] = {"prompt": job.get("prompt") or "", "resume": job.get("resume")}
+        resume = job.get("resume")
+        prompt = job.get("prompt") or ""
+        if not resume and office_session(task["id"]):
+            # The Mac didn't know the session but this server does: carry on in it.
+            resume = office_session(task["id"])
+        task["rework"] = {"prompt": prompt, "resume": resume}
         task["budgetUSD"], task["budgetTokens"] = job.get("budgetUSD"), job.get("budgetTokens")
         task["review"] = bool(job.get("review"))
         task["state"] = "queued"
@@ -1668,23 +1785,31 @@ def run_worker():
 
     def work(job):
         try:
-            handler = {"tests": job_tests, "review": job_review, "lines": job_lines}.get(job.get("kind"))
-            result = handler(job) if handler else {"state": "failed", "output": "unknown job"}
-        except Exception as error:  # a broken job must not stop the worker
-            result = {"state": "failed", "output": str(error)}
-        result.update({"id": job["id"], "kind": job["kind"]})
-        add_result(result)
-        save_json_list(QUEUE_PATH, [item for item in load_json_list(QUEUE_PATH) if item.get("id") != job["id"]])
-        busy.clear()
+            try:
+                handler = {"tests": job_tests, "review": job_review, "lines": job_lines}.get(job.get("kind"))
+                result = handler(job) if handler else {"state": "failed", "output": "unknown job"}
+            except Exception as error:  # a broken job must not stop the worker
+                result = {"state": "failed", "output": str(error)}
+            result.update({"id": job["id"], "kind": job["kind"]})
+            add_result(result)
+            queue_remove(job["id"])
+        except Exception:
+            pass  # a full disk, say: the job stays queued and runs again
+        finally:
+            busy.clear()  # whatever happened, the slot is free again
 
     def finish_office(task, code, reason):
         try:
-            state = office_finish(task, code, reason)
-        except Exception as error:
-            state = "failed"
-            office_result(task, "failed", output=str(error))
-        office_update(task["id"], lambda item: item.update(state=state, rework=None, stopReason=None))
-        busy.clear()
+            try:
+                state = office_finish(task, code, reason)
+            except Exception as error:
+                state = "failed"
+                office_result(task, "failed", output=str(error))
+            office_update(task["id"], lambda item: item.update(state=state, rework=None, stopReason=None))
+        except Exception:
+            pass
+        finally:
+            busy.clear()
 
     started = time.time()
     while True:
@@ -1703,7 +1828,7 @@ def run_worker():
                 # acknowledge it on the next request -- a lost reply only
                 # means the Mac sends it again and it's recognised here.
                 nights = load_json_list(NIGHT_PATH)
-                queue = load_json_list(QUEUE_PATH)
+                new_jobs = []
                 with OFFICE_LOCK:
                     office = load_json_list(OFFICE_PATH)
                     office_ids = {task.get("id") for task in office}
@@ -1724,21 +1849,25 @@ def run_worker():
                                     if item["id"] in running:
                                         running[item["id"]][0].terminate()
                         else:
-                            queue.append(job)
+                            new_jobs.append(job)
                     office_save(office)
                 save_json_list(NIGHT_PATH, nights)
-                save_json_list(QUEUE_PATH, queue)
+                queue_add(new_jobs)
                 seen = (seen + [job["id"] for job in jobs if job["id"] not in seen])[-SEEN_KEEP:]
                 save_json_list(SEEN_PATH, seen)
                 received = [job["id"] for job in jobs]
             nights = load_json_list(NIGHT_PATH)
-            queue = load_json_list(QUEUE_PATH)
             office = load_json_list(OFFICE_PATH)
-            heavy = next_heavy(queue, nights, busy.is_set(), running or office_running, now, office)
-            if heavy and heavy[0] == "job":
-                busy.set()
-                threading.Thread(target=work, args=(heavy[1],), daemon=True).start()
-            elif heavy and heavy[0] == "office":
+            # Read the queue, pick and take the slot in one go: a job that just
+            # finished has left the queue before its slot is free (work() removes
+            # it, then clears busy), so a stale read can't start it again.
+            with QUEUE_LOCK:
+                queue = load_json_list(QUEUE_PATH)
+                heavy = next_heavy(queue, nights, busy.is_set(), running or office_running, now, office)
+                if heavy and heavy[0] == "job":
+                    busy.set()
+                    threading.Thread(target=work, args=(heavy[1],), daemon=True).start()
+            if heavy and heavy[0] == "office":
                 task = heavy[1]
                 rework = task.get("rework") or {}
                 error = None if task.get("branch") or task.get("workdir") else office_prepare(task)
@@ -1755,7 +1884,7 @@ def run_worker():
                     fields = {"state": "running"}
                 fields.update({key: task.get(key) for key in ("branch", "base", "workdir")})
                 office_update(task["id"], lambda item: item.update(fields))
-            elif heavy:
+            elif heavy and heavy[0] == "night":
                 job = heavy[1]
                 process, error = start_night_job(job)
                 if process is None:

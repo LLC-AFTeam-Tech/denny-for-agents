@@ -327,6 +327,8 @@ struct L {
     static var phoneDenied: String { t("phone.denied") }
     static var phoneExpired: String { t("phone.expired") }
     static var phoneReplyHint: String { t("phone.replyHint") }
+    static func phoneFinishedTask(_ task: String) -> String { t("phone.finishedTask", task) }
+    static func phoneFinishedFiles(_ count: Int, _ names: String) -> String { t("phone.finishedFiles", count, names) }
     static var phoneReplyUnknown: String { t("phone.replyUnknown") }
     static func phoneReplyLive(_ agent: AgentKind) -> String { t("phone.replyLive", agent.displayName) }
     static func phoneReplyBackground(_ agent: AgentKind, _ place: String) -> String { t("phone.replyBackground", agent.displayName, place) }
