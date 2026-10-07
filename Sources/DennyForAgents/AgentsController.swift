@@ -28,6 +28,10 @@ final class AgentsController {
     private var nightProcess: Process?
     /// Queued and finished night-shift jobs, saved in ~/.denny-for-agents.
     private(set) var nightJobs = NightShift.load()
+    /// For the settings board.
+    var onOfficeChange: () -> Void = {}
+    /// Tasks for Claude and Codex as staff, each in its own git branch.
+    private(set) lazy var office = OfficeRunner(binary: { AgentsController.binary(for: $0) })
     private var swipe = CGVector.zero
     private var swipeDone = false
     private var timer: Timer?
@@ -67,6 +71,18 @@ final class AgentsController {
         telegram.onReply = { [weak self] task, text, message in self?.phoneReplied(task, text: text, message: message) }
         server.onReplyOffered = { [weak self] event, id in self?.holdForReply(event, id: id) ?? false }
         telegram.start()
+        office.sendRemote = { [weak self] job, host in self?.queue(job, host: host) }
+        office.limits = { [weak self] in self?.model.summary.limits ?? [:] }
+        office.onReport = { [weak self] task in self?.reportOffice(task) }
+        office.onAcceptFailed = { [weak self] task, error in self?.officeAcceptFailed(task, error: error) }
+        office.onStandup = { [weak self] standup in self?.telegram.send(OfficeTexts.standup(standup), force: true) }
+        telegram.onOfficeAction = { [weak self] action, payload, message in self?.officeAction(action, payload: payload, message: message) }
+        telegram.onOfficeRework = { [weak self] id, text, message in self?.officeRework(id, text: text, message: message) }
+        telegram.onCommand = { [weak self] command, text, message in self?.telegramCommand(command, text: text, message: message) }
+        office.onChange = { [weak self] in
+            self?.updateAwake()
+            self?.onOfficeChange()
+        }
         swipeMonitor = NSEvent.addLocalMonitorForEvents(matching: .scrollWheel) { [weak self] event in
             guard let self else { return event }
             return self.handleSwipe(event)
@@ -160,7 +176,7 @@ final class AgentsController {
         let localWork = store.sessions.values.contains {
             $0.host == nil && ($0.status == .working || $0.status == .waitingApproval)
         }
-        let nightWork = nightProcess != nil
+        let nightWork = nightProcess != nil || office.isWorking
         let hold = (settings.keepAwake && localWork) || settings.manualAwakeActive || nightWork
         keepAwake.update(shouldHold: hold)
         lidGuard.set(hold && settings.keepAwakeLidClosed && LidSleepGuard.onACPower)
@@ -200,7 +216,10 @@ final class AgentsController {
 
     private func handle(_ event: HookEvent, requestId: String?) {
         if let host = event.host { remoteSeen[host] = Date() }
-        if event.nightShift != nil { nightSessions.insert(AgentStore.key(agent: event.agent, sessionId: event.sessionId)) }
+        if let night = event.nightShift {
+            nightSessions.insert(AgentStore.key(agent: event.agent, sessionId: event.sessionId))
+            if office.contains(night) { office.noteSession(task: night, sessionId: event.sessionId) }
+        }
         let effects = store.apply(event, requestId: requestId)
         for effect in effects {
             switch effect {
@@ -218,7 +237,9 @@ final class AgentsController {
                         peek(.finished(title: title, detail: detail), cooldown: Self.finishPeekCooldown)
                     }
                 }
-                if telegram.settings.sendFinished, let session = store.sessions[key] {
+                // An Office task reports with its own message (with buttons).
+                let officeSession = store.sessions[key].map { office.task(forSession: $0.sessionId) != nil } ?? false
+                if telegram.settings.sendFinished, !officeSession, let session = store.sessions[key] {
                     let task = session.cwd.map { PhoneReplies.Task(agent: session.agent, sessionId: session.sessionId,
                                                                    folder: $0, host: session.host) }
                     telegram.sendFinished("✅ " + L.finishedTitle(session.agent) + " · "
@@ -244,6 +265,11 @@ final class AgentsController {
                     react(.think)
                 }
             case .receipt(let receipt):
+                if let session = store.sessions[receipt.sessionKey], let task = office.task(forSession: session.sessionId) {
+                    // The Office runs its own tests and review in the task's working copy.
+                    office.noteTurn(task: task.id, summary: session.lastMessage, tokens: receipt.tokens, cost: receipt.cost)
+                    continue
+                }
                 model.receipt = receipt
                 model.receiptTestCommand = nil
                 model.reviewer = nil
@@ -426,6 +452,7 @@ final class AgentsController {
         refreshHooksState()
         if settings.quietUntil != nil, !settings.isQuiet { settings.quietUntil = nil }
         startDueNightJob()
+        office.tick()
         updateAwake()
         model.summary = UsageSummary.combine(Array(reports.values))
         render()
@@ -834,6 +861,7 @@ final class AgentsController {
 
     private func queue(_ job: RemoteJob, host: String, quietly: Bool = false) {
         remoteJobs[host, default: []].append(job)
+        if Date().timeIntervalSince(workerSeen[host] ?? .distantPast) > 30 { ssh.wakeWorker(host: host) }
         if !quietly, Date().timeIntervalSince(workerSeen[host] ?? .distantPast) > 30 {
             showDropMessage(DropMessage(title: L.serverJobWaits(host), warning: nil))
         }
@@ -901,6 +929,8 @@ final class AgentsController {
             NightShift.save(nightJobs)
         case .cancel:
             break
+        case .office, .officeRework, .officeAccept, .officeDiscard:
+            office.apply(result)
         }
     }
 

@@ -233,10 +233,13 @@ final class HookInstallerTests: XCTestCase {
         XCTAssertNil(HookInstaller.removed(config: merged, agent: .claude)["hooks"])
     }
 
-    func testCodexUsesTopLevelTableAndApprovalTimeout() {
+    func testCodexUsesTheHooksKeyAndApprovalTimeout() {
+        // Codex 0.14x reads only "hooks" (and "description") at the top level.
         let merged = HookInstaller.merged(config: [:], agent: .codex, hookPath: hook)
-        XCTAssertEqual(Set(merged.keys), Set(HookInstaller.events(for: .codex).map(\.rawValue)))
-        let entry = (merged["PermissionRequest"] as? [Any])?.first as? [String: Any]
+        XCTAssertEqual(Set(merged.keys), ["hooks"])
+        let table = merged["hooks"] as? [String: Any] ?? [:]
+        XCTAssertEqual(Set(table.keys), Set(HookInstaller.events(for: .codex).map(\.rawValue)))
+        let entry = (table["PermissionRequest"] as? [Any])?.first as? [String: Any]
         let command = (entry?["hooks"] as? [Any])?.first as? [String: Any]
         XCTAssertEqual(command?["timeout"] as? Int, HookInstaller.approvalTimeoutSeconds)
         XCTAssertEqual(command?["command"] as? String, "'\(hook)' codex")
@@ -1411,7 +1414,7 @@ final class PhoneRepliesTests: XCTestCase {
     }
 
     func testStopMayWaitForTheReply() {
-        let table = HookInstaller.merged(config: [:], agent: .codex, hookPath: "/x/denny-hook")
+        let table = HookInstaller.merged(config: [:], agent: .codex, hookPath: "/x/denny-hook")["hooks"] as? [String: Any] ?? [:]
         let stop = ((table["Stop"] as? [[String: Any]])?.first?["hooks"] as? [[String: Any]])?.first
         XCTAssertEqual(stop?["timeout"] as? Int, HookInstaller.replyTimeoutSeconds)
         XCTAssertGreaterThan(HookInstaller.replyTimeoutSeconds, HookInstaller.replyWaitSeconds)
@@ -1460,5 +1463,236 @@ final class PeerClosedTests: XCTestCase {
         client?.close()
         client = nil
         XCTAssertTrue(server.peerHasClosed)
+    }
+}
+
+final class OfficeTests: XCTestCase {
+    private func task(_ folder: String, at seconds: Double, agent: AgentKind = .claude) -> OfficeTask {
+        OfficeTask(prompt: "do \(seconds)", agent: agent, folder: folder, createdAt: Date(timeIntervalSince1970: seconds))
+    }
+
+    func testOneTaskPerFolderAndAFewAtATime() {
+        var working = task("/a", at: 1)
+        working.state = .working(since: Date())
+        let tasks = [working, task("/a", at: 2), task("/b", at: 3), task("/b", at: 4), task("/c", at: 5)]
+        // /a is busy, one /b, and /c would make three at once.
+        XCTAssertEqual(Office.startable(tasks).map(\.prompt), ["do 3.0"])
+        XCTAssertEqual(Office.startable([task("/x", at: 1, agent: .codex)], host: "srv"), [])
+    }
+
+    func testColumnsAndTitle() {
+        var item = task("/a", at: 1)
+        item.prompt = "Make the contact form\nwith validation"
+        XCTAssertEqual(item.title, "Make the contact form")
+        XCTAssertEqual(item.column, .inbox)
+        item.state = .failed(at: Date(), reason: "exit 1")
+        XCTAssertEqual(item.column, .review)
+        item.state = .discarded(at: Date())
+        XCTAssertEqual(item.column, .done)
+    }
+
+    func testARestartMarksRunningTasksInterrupted() {
+        var item = task("/a", at: 1)
+        item.state = .working(since: Date())
+        let after = Office.interrupted([item, task("/b", at: 2)], reason: "restarted")
+        XCTAssertEqual(after.map(\.column), [.review, .inbox])
+    }
+
+    func testTheAgentRunsInTheSameSubfolderOfItsOwnCopy() {
+        XCTAssertEqual(Office.runFolder(folder: "/p/app/web", repoRoot: "/p/app", workdir: "/w/app-1"), "/w/app-1/web")
+        XCTAssertEqual(Office.runFolder(folder: "/p/app", repoRoot: "/p/app", workdir: "/w/app-1"), "/w/app-1")
+        var item = task("/p/app", at: 1)
+        item.workdir = "/w/app-1"
+        XCTAssertEqual(Array(Office.arguments(item).prefix(2)), ["-p", "do 1.0"])
+        XCTAssertEqual(item.runFolder, "/w/app-1")
+    }
+
+    func testABranchPerTaskThenAcceptMergesIt() throws {
+        let home = FileManager.default.temporaryDirectory.appendingPathComponent("office-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: home) }
+        let repo = home.appendingPathComponent("project").path
+        try FileManager.default.createDirectory(atPath: repo + "/web", withIntermediateDirectories: true)
+        try "a".write(toFile: repo + "/web/a.txt", atomically: true, encoding: .utf8)
+        for args in [["init", "-q"], ["config", "user.email", "t@t"], ["config", "user.name", "T"], ["add", "-A"], ["commit", "-qm", "init"]] {
+            XCTAssertEqual(OfficeWorkspace.git(["-C", repo] + args).status, 0, args.joined(separator: " "))
+        }
+        let prepared = OfficeWorkspace.prepare(task(repo + "/web", at: 1), home: home)
+        XCTAssertNil(prepared.error)
+        let item = prepared.task
+        let workdir = try XCTUnwrap(item.workdir)
+        XCTAssertTrue(workdir.hasSuffix("/web"))
+        try "b".write(toFile: workdir + "/b.txt", atomically: true, encoding: .utf8)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: repo + "/web/b.txt"))  // the project is untouched
+        XCTAssertTrue(OfficeWorkspace.commitLeftovers(item))
+        XCTAssertNil(OfficeWorkspace.accept(item))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: repo + "/web/b.txt"))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: workdir))
+        XCTAssertNotEqual(OfficeWorkspace.git(["-C", repo, "rev-parse", "--verify", "-q", Office.branch(for: item)]).status, 0)
+    }
+
+    func testDiscardThrowsTheWorkAway() throws {
+        let home = FileManager.default.temporaryDirectory.appendingPathComponent("office-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: home) }
+        let repo = home.appendingPathComponent("project").path
+        try FileManager.default.createDirectory(atPath: repo, withIntermediateDirectories: true)
+        try "a".write(toFile: repo + "/a.txt", atomically: true, encoding: .utf8)
+        for args in [["init", "-q"], ["config", "user.email", "t@t"], ["config", "user.name", "T"], ["add", "-A"], ["commit", "-qm", "init"]] {
+            XCTAssertEqual(OfficeWorkspace.git(["-C", repo] + args).status, 0)
+        }
+        let item = OfficeWorkspace.prepare(task(repo, at: 1), home: home).task
+        try "b".write(toFile: try XCTUnwrap(item.workdir) + "/b.txt", atomically: true, encoding: .utf8)
+        OfficeWorkspace.discard(item)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: try XCTUnwrap(item.workdir)))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: repo + "/b.txt"))
+    }
+
+    func testAFolderOutsideGitIsUsedAsItIs() throws {
+        let folder = FileManager.default.temporaryDirectory.appendingPathComponent("plain-\(UUID().uuidString)").path
+        try FileManager.default.createDirectory(atPath: folder, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(atPath: folder) }
+        let prepared = OfficeWorkspace.prepare(task(folder, at: 1))
+        XCTAssertNil(prepared.error)
+        XCTAssertNil(prepared.task.branch)
+        XCTAssertEqual(prepared.task.runFolder, folder)
+    }
+}
+
+final class OfficeManagementTests: XCTestCase {
+    private func limits(_ agent: AgentKind, _ percent: Double) -> UsageReport.Limits {
+        UsageReport.Limits(agent: agent, windows: [UsageReport.Window(kind: "5h", percent: percent)], observedAt: 0)
+    }
+
+    func testDennyGivesTheTaskToWhoeverHasMoreLeft() {
+        XCTAssertEqual(Office.pickAgent(limits: [.claude: limits(.claude, 85), .codex: limits(.codex, 20)]), .codex)
+        XCTAssertEqual(Office.pickAgent(limits: [.claude: limits(.claude, 10), .codex: limits(.codex, 20)]), .claude)
+        XCTAssertEqual(Office.pickAgent(limits: [:]), .claude)
+        XCTAssertEqual(Office.pickAgent(limits: [.codex: limits(.codex, 90)], available: [.codex]), .codex)
+    }
+
+    func testBudgets() {
+        var settings = OfficeSettings()
+        XCTAssertEqual(Office.budgetArguments(agent: .claude, settings: settings), [])
+        settings.claudeBudget = 2
+        XCTAssertEqual(Office.budgetArguments(agent: .claude, settings: settings), ["--max-budget-usd", "2.00"])
+        XCTAssertEqual(Office.budgetArguments(agent: .codex, settings: settings), [])
+        let task = OfficeTask(prompt: "go", agent: .claude, folder: "/p")
+        XCTAssertEqual(Array(Office.arguments(task, settings: settings).suffix(2)), ["--max-budget-usd", "2.00"])
+        let item = UsageReport.Item(hour: 0, agent: .codex, model: "gpt", input: 100, cacheWrite5m: 5, cacheRead: 10_000, output: 50)
+        XCTAssertEqual(Office.budgetTokens([item]), 155)  // cache reads don't count
+        settings.codexBudgetK = 30
+        var codex = task
+        codex.agent = .codex
+        XCTAssertEqual(Office.remoteStart(codex, settings: settings).budgetTokens, 30_000)
+        XCTAssertNil(Office.remoteStart(codex, settings: settings).budgetUSD)
+    }
+
+    func testReworkGoesOnInTheSameSession() {
+        var task = OfficeTask(prompt: "Add the form", agent: .claude, folder: "/p")
+        task.workdir = "/w"
+        task.sessionId = "abc-1"
+        let resumed = Office.reworkArguments(task, remarks: "add validation")
+        XCTAssertTrue(resumed.contains("--resume") && resumed.contains("abc-1"))
+        XCTAssertTrue(resumed[1].hasSuffix("add validation"))
+        task.sessionId = nil
+        let fresh = Office.reworkArguments(task, remarks: "add validation")
+        XCTAssertFalse(fresh.contains("--resume"))
+        XCTAssertTrue(fresh[1].hasPrefix("Add the form") && fresh[1].hasSuffix("add validation"))
+        task.sessionId = "abc-1"
+        let job = Office.remoteRework(task, remarks: "add validation", settings: OfficeSettings())
+        XCTAssertEqual(job.kind, .officeRework)
+        XCTAssertEqual(job.target, task.id)
+        XCTAssertEqual(job.resume, "abc-1")
+        XCTAssertNotEqual(job.id, task.id)
+    }
+
+    func testAServerReportsOnItsTask() {
+        var task = OfficeTask(prompt: "go", agent: .codex, folder: "/srv/app", host: "srv")
+        var result = RemoteJobResult(id: "r1", kind: .office, state: "running")
+        result.task = task.id
+        XCTAssertTrue(Office.apply(result, to: &task))
+        XCTAssertEqual(task.column, .working)
+        result = RemoteJobResult(id: "r2", kind: .office, state: "review", added: 4, removed: 1)
+        result.task = task.id
+        result.files = ["a.py"]
+        result.tests = "passed"
+        result.review = "- a.py:3 off by one"
+        result.reviewer = .claude
+        XCTAssertTrue(Office.apply(result, to: &task))
+        XCTAssertEqual(task.column, .review)
+        XCTAssertEqual(task.report?.files, ["a.py"])
+        XCTAssertEqual(task.report?.findings, 1)
+        result.state = "something new"
+        XCTAssertFalse(Office.apply(result, to: &task))
+    }
+
+    func testRecurringTasksAndTheStandupComeOnceADay() {
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = TimeZone(identifier: "UTC")!
+        let monday10 = Date(timeIntervalSince1970: 1_791_799_200)  // Mon 2026-10-12 10:00 UTC
+        var item = OfficeRecurring(prompt: "update deps", agent: nil, folder: "/p", weekday: 2, hour: 10)
+        XCTAssertTrue(item.isDue(now: monday10, calendar: calendar))
+        XCTAssertFalse(item.isDue(now: monday10.addingTimeInterval(-3600), calendar: calendar))
+        XCTAssertFalse(item.isDue(now: monday10.addingTimeInterval(86400), calendar: calendar))  // Tuesday
+        item.lastRun = monday10
+        XCTAssertFalse(item.isDue(now: monday10.addingTimeInterval(3600), calendar: calendar))
+        var settings = OfficeSettings()
+        settings.standupHour = 9
+        XCTAssertTrue(Office.standupDue(settings, now: monday10, calendar: calendar))
+        settings.lastStandup = monday10
+        XCTAssertFalse(Office.standupDue(settings, now: monday10.addingTimeInterval(3600), calendar: calendar))
+        settings.standupHour = nil
+        XCTAssertFalse(Office.standupDue(settings, now: monday10.addingTimeInterval(86400), calendar: calendar))
+    }
+
+    func testTheStandupCountsTheLastDay() {
+        let now = Date()
+        var done = OfficeTask(prompt: "done", agent: .claude, folder: "/p", createdAt: now.addingTimeInterval(-3600))
+        done.state = .accepted(at: now.addingTimeInterval(-60))
+        var report = OfficeReport()
+        report.cost = 0.5
+        done.report = report
+        var old = OfficeTask(prompt: "old", agent: .claude, folder: "/p", createdAt: now.addingTimeInterval(-9 * 86400))
+        old.state = .accepted(at: now.addingTimeInterval(-8 * 86400))
+        var waiting = OfficeTask(prompt: "waiting", agent: .codex, folder: "/p")
+        waiting.state = .review(at: now)
+        let standup = Office.standup([done, old, waiting, OfficeTask(prompt: "q", agent: .claude, folder: "/p")],
+                                     since: now.addingTimeInterval(-86400))
+        XCTAssertEqual(standup.finished.map(\.prompt), ["done"])
+        XCTAssertEqual(standup.waiting.map(\.prompt), ["waiting"])
+        XCTAssertEqual(standup.queued, 1)
+        XCTAssertEqual(standup.cost, 0.5, accuracy: 0.001)
+    }
+
+    func testTelegramCommands() {
+        XCTAssertEqual(Office.command("/task@DennyBot fix the form")?.name, "task")
+        XCTAssertEqual(Office.command("/task@DennyBot fix the form")?.rest, "fix the form")
+        XCTAssertEqual(Office.command("/board")?.rest, "")
+        XCTAssertNil(Office.command("/start 123456"))  // pairing stays pairing
+        XCTAssertNil(Office.command("task"))
+    }
+}
+
+final class OfficeFailureTests: XCTestCase {
+    func testAFailedRunSaysWhy() {
+        XCTAssertEqual(Office.failureReason(log: nil, status: 1), "exit 1")
+        XCTAssertEqual(Office.failureReason(log: "\n  \n", status: 2), "exit 2")
+        XCTAssertEqual(Office.failureReason(log: "a\nb\n\nInvalid API key · Please run /login\n", status: 1),
+                       "exit 1: a · b · Invalid API key · Please run /login")
+    }
+}
+
+final class CodexHooksLayoutTests: XCTestCase {
+    func testTheOldTopLevelLayoutIsMovedUnderHooks() {
+        let entry: [String: Any] = ["hooks": [["type": "command", "command": "'/x/denny-hook' codex", "timeout": 5]]]
+        let mine: [String: Any] = ["hooks": [["type": "command", "command": "my-own-script"]]]
+        let old: [String: Any] = ["Stop": [entry], "PreToolUse": [mine], "description": "my hooks"]
+        XCTAssertTrue(HookInstaller.isInstalled(config: old, agent: .codex))
+        XCTAssertTrue(HookInstaller.isOutdated(config: old, agent: .codex))
+        let fixed = HookInstaller.merged(config: old, agent: .codex, hookPath: "/x/denny-hook")
+        XCTAssertEqual(Set(fixed.keys), ["hooks", "description"])
+        let table = fixed["hooks"] as? [String: Any] ?? [:]
+        XCTAssertEqual((table["PreToolUse"] as? [Any])?.count, 2)  // the user's own hook is kept
+        XCTAssertFalse(HookInstaller.isOutdated(config: fixed, agent: .codex))
+        XCTAssertEqual(Set(HookInstaller.removed(config: fixed, agent: .codex).keys), ["hooks", "description"])
     }
 }

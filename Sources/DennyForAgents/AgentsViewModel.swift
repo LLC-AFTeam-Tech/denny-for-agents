@@ -331,6 +331,62 @@ struct L {
     static func phoneReplyLive(_ agent: AgentKind) -> String { t("phone.replyLive", agent.displayName) }
     static func phoneReplyBackground(_ agent: AgentKind, _ place: String) -> String { t("phone.replyBackground", agent.displayName, place) }
     static var phoneReplyFailed: String { t("phone.replyFailed") }
+    static var officeInterrupted: String { t("office.interrupted") }
+    static var officeStopped: String { t("office.stopped") }
+    static var officeNewTask: String { t("office.newTask") }
+    static var officeGive: String { t("office.give") }
+    static func officeColumn(_ column: OfficeTask.Column) -> String { t("office.column." + column.rawValue) }
+    static var officeRemove: String { t("office.remove") }
+    static var officeStop: String { t("office.stop") }
+    static var officeAccept: String { t("office.accept") }
+    static var officeDiscard: String { t("office.discard") }
+    static var officeWaiting: String { t("office.waiting") }
+    static func officeReadyAt(_ time: String) -> String { t("office.readyAt", time) }
+    static var officeAccepted: String { t("office.accepted") }
+    static var officeDiscarded: String { t("office.discarded") }
+    static func officeAcceptFailed(_ reason: String) -> String { t("office.acceptFailed", reason) }
+    static var officeNoGit: String { t("office.noGit") }
+    static var officeEmpty: String { t("office.empty") }
+    static var officeFooter: String { t("office.footer") }
+    static var officeAuto: String { t("office.auto") }
+    static var officeRepeat: String { t("office.repeat") }
+    static var officeEveryDay: String { t("office.everyDay") }
+    static func officeAtHour(_ value: Int) -> String { t("office.atHour", value) }
+    static var officeAddRecurring: String { t("office.addRecurring") }
+    static var officeRecurringTitle: String { t("office.recurringTitle") }
+    static var officeRework: String { t("office.rework") }
+    static var officeSendRework: String { t("office.sendRework") }
+    static var officeCancel: String { t("office.cancel") }
+    static var officeHowTitle: String { t("office.howTitle") }
+    static var officeReviewToggle: String { t("office.reviewToggle") }
+    static var officeClaudeBudget: String { t("office.claudeBudget") }
+    static var officeCodexBudget: String { t("office.codexBudget") }
+    static var officeStandupToggle: String { t("office.standupToggle") }
+    static var officeHowFooter: String { t("office.howFooter") }
+    static var officeOverBudget: String { t("office.overBudget") }
+    static func officeReviewClean(_ value: String) -> String { t("office.reviewClean", value) }
+    static func officeReviewFindings(_ name: String, _ count: Int) -> String { t("office.reviewFindings", name, count) }
+    static func officeChanges(_ a: Int, _ b: Int, _ c: Int) -> String { t("office.changes", a, b, c) }
+    static var officeTestsPassed: String { t("office.testsPassed") }
+    static var officeTestsFailed: String { t("office.testsFailed") }
+    static var officeTgExpired: String { t("office.tg.expired") }
+    static func officeTgAccepted(_ value: String) -> String { t("office.tg.accepted", value) }
+    static var officeTgDiscarded: String { t("office.tg.discarded") }
+    static func officeTgGiven(_ first: String, _ second: String) -> String { t("office.tg.given", first, second) }
+    static func officeTgReworking(_ value: String) -> String { t("office.tg.reworking", value) }
+    static var officeTgHow: String { t("office.tg.how") }
+    static var officeTgNoFolders: String { t("office.tg.noFolders") }
+    static var officeTgPick: String { t("office.tg.pick") }
+    static var officeTgBoardEmpty: String { t("office.tg.boardEmpty") }
+    static var officeTgReplyHint: String { t("office.tg.replyHint") }
+    static var officeTgTaskCommand: String { t("office.tg.taskCommand") }
+    static var officeTgBoardCommand: String { t("office.tg.boardCommand") }
+    static var officeStandupTitle: String { t("office.standup.title") }
+    static func officeStandupDone(_ value: Int) -> String { t("office.standup.done", value) }
+    static func officeStandupWaiting(_ value: Int) -> String { t("office.standup.waiting", value) }
+    static func officeStandupWorking(_ value: Int) -> String { t("office.standup.working", value) }
+    static func officeStandupQueued(_ value: Int) -> String { t("office.standup.queued", value) }
+    static func officeStandupSpent(_ value: String) -> String { t("office.standup.spent", value) }
     static var phoneBadToken: String { t("phone.badToken") }
     static var phonePaired: String { t("phone.paired") }
     static var phoneTitle: String { t("phone.title") }

@@ -38,8 +38,9 @@ public enum HookInstaller {
 
     // MARK: - Pure merge / removal
 
-    /// Claude keeps hooks under a top-level "hooks" key; Codex's hooks.json
-    /// is the hooks table itself.
+    /// Claude keeps hooks under a top-level "hooks" key, and so does Codex
+    /// since 0.14x (it refuses anything else at the top level). Older Codex
+    /// hooks.json was the table itself: read either, write the new layout.
     public static func merged(config: [String: Any], agent: AgentKind, hookPath: String) -> [String: Any] {
         var table = hooksTable(in: config, agent: agent)
         table = removingOurs(from: table)
@@ -69,6 +70,8 @@ public enum HookInstaller {
     public static func isOutdated(config: [String: Any], agent: AgentKind) -> Bool {
         let table = hooksTable(in: config, agent: agent)
         guard isInstalled(config: config, agent: agent) else { return false }
+        // Codex's old layout (events at the top level): new Codex won't read it.
+        if agent == .codex, config["hooks"] == nil { return true }
         return events(for: agent).contains { event in
             let expected = event == .permissionRequest ? approvalTimeoutSeconds
                 : event == .stop ? replyTimeoutSeconds : eventTimeoutSeconds
@@ -86,10 +89,15 @@ public enum HookInstaller {
     }
 
     private static func hooksTable(in config: [String: Any], agent: AgentKind) -> [String: Any] {
+        if let table = config["hooks"] as? [String: Any] { return table }
         switch agent {
-        case .claude: return config["hooks"] as? [String: Any] ?? [:]
-        case .codex: return config
+        case .claude: return [:]
+        case .codex: return config.filter { isLegacyCodexEntry($0.key, $0.value) }
         }
+    }
+
+    private static func isLegacyCodexEntry(_ key: String, _ value: Any) -> Bool {
+        HookEventName(rawValue: key) != nil || value is [Any]
     }
 
     private static func withHooksTable(_ table: [String: Any], in config: [String: Any], agent: AgentKind) -> [String: Any] {
@@ -99,7 +107,9 @@ public enum HookInstaller {
             next["hooks"] = table.isEmpty ? nil : table
             return next
         case .codex:
-            return table
+            var next = config.filter { !isLegacyCodexEntry($0.key, $0.value) }
+            next["hooks"] = table.isEmpty ? nil : table
+            return next
         }
     }
 

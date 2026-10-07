@@ -78,6 +78,8 @@ public enum SSHLink {
     }
 
     public static let reportCommand = "python3 ~/.denny-for-agents/denny-hook.py --report"
+    /// Jobs were queued for this server: start its worker if it's asleep.
+    public static let startWorkerCommand = "python3 ~/.denny-for-agents/denny-hook.py --start-worker"
     public static let uninstallCommand = "python3 ~/.denny-for-agents/denny-hook.py --uninstall"
 
     /// Why ssh gave up, from its stderr, in terms the settings can explain.

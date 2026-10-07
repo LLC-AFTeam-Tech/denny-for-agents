@@ -80,6 +80,11 @@ RESULTS_PATH = os.path.join(BASE_DIR, "job-results.json")
 SEEN_PATH = os.path.join(BASE_DIR, "job-seen.json")
 QUEUE_PATH = os.path.join(BASE_DIR, "job-queue.json")
 SEEN_KEEP = 500
+# Office: tasks for Claude/Codex as staff, each in its own git branch and
+# working copy under ~/.denny-for-agents/office. Mirrors AgentCore/Office.swift.
+OFFICE_PATH = os.path.join(BASE_DIR, "office.json")
+OFFICE_DIR = os.path.join(BASE_DIR, "office")
+OFFICE_KEEP = 50
 WORKER_IDLE_SECONDS = 2 * 3600
 TEST_TIMEOUT_SECONDS = 10 * 60
 REVIEW_TIMEOUT_SECONDS = 10 * 60
@@ -328,6 +333,10 @@ def run_hook(agent):
     night = os.environ.get(NIGHT_ENV)
     if night:
         event["nightShift"] = night
+        try:
+            remember_office_session(night, payload.get("session_id"))
+        except OSError:
+            pass
         if agent == "claude" and event["name"] == "PreToolUse":
             output = night_output(payload.get("tool_name"), payload.get("tool_input"))
             if output:
@@ -1313,18 +1322,331 @@ def ask_for_jobs(port, token, results, received=()):
         conn.close()
 
 
-def next_heavy(queue, nights, busy, running, now):
-    """What may start now, if anything: ("job", job) or ("night", job). One heavy
-    thing at a time -- tests, a review or a night agent -- since they share the
-    server's memory. Tests go first; a due night job waits for them."""
+# ---------------------------------------------------------------- office
+
+def office_git(args, timeout=120):
+    """(exit code, combined output) of git; never raises."""
+    try:
+        result = subprocess.run(["git"] + args, capture_output=True, text=True, timeout=timeout, errors="replace")
+        return result.returncode, (result.stdout + result.stderr).strip()
+    except (OSError, subprocess.TimeoutExpired) as error:
+        return -1, str(error)
+
+
+def office_branch(task_id):
+    return "denny/office-" + task_id[:8].lower()
+
+
+def office_repo(folder):
+    code, out = office_git(["-C", folder, "rev-parse", "--show-toplevel"])
+    return out if code == 0 and out else None
+
+
+def office_run_folder(folder, repo, workdir):
+    root, path = os.path.realpath(repo), os.path.realpath(folder)
+    if not path.startswith(root + os.sep):
+        return workdir
+    return os.path.join(workdir, path[len(root) + 1:])
+
+
+def office_prepare(task):
+    """Own branch and working copy; a folder outside git is used as it is.
+    Returns an error text or None."""
+    if not os.path.isdir(task.get("cwd") or ""):
+        return "not found"
+    repo = office_repo(task["cwd"])
+    if not repo:
+        return None
+    code, branch = office_git(["-C", repo, "rev-parse", "--abbrev-ref", "HEAD"])
+    base = branch if code == 0 and branch and branch != "HEAD" else office_git(["-C", repo, "rev-parse", "HEAD"])[1]
+    copy = os.path.join(OFFICE_DIR, os.path.basename(repo) + "-" + task["id"][:8].lower())
+    os.makedirs(OFFICE_DIR, mode=0o700, exist_ok=True)
+    code, out = office_git(["-C", repo, "worktree", "add", "-b", office_branch(task["id"]), copy, "HEAD"])
+    if code != 0:
+        return out or "git worktree"
+    task["branch"], task["base"] = office_branch(task["id"]), base
+    task["workdir"] = office_run_folder(task["cwd"], repo, copy)
+    return None
+
+
+def office_copy_root(task):
+    return office_repo(task["workdir"]) if task.get("workdir") and os.path.isdir(task["workdir"]) else None
+
+
+def office_commit_leftovers(task):
+    copy = office_copy_root(task)
+    if not copy or office_git(["-C", copy, "add", "-A"])[0] != 0:
+        return
+    if office_git(["-C", copy, "diff", "--cached", "--quiet"])[0] == 1:
+        office_git(["-C", copy, "-c", "commit.gpgsign=false", "commit", "-q", "--no-verify",
+                    "-m", "%s: %s" % ("Codex" if task.get("agent") == "codex" else "Claude Code", office_title(task))])
+
+
+def office_title(task):
+    line = (task.get("prompt") or "").strip().splitlines()[0] if (task.get("prompt") or "").strip() else ""
+    return line if len(line) <= 80 else line[:79] + "…"
+
+
+def office_changes(task):
+    """(files, added, removed) since the task started."""
+    copy = office_copy_root(task)
+    if not copy or not task.get("base"):
+        return [], 0, 0
+    code, out = office_git(["-C", copy, "diff", "--numstat", task["base"] + "...HEAD"])
+    files, added, removed = [], 0, 0
+    for line in (out if code == 0 else "").splitlines():
+        parts = line.split("\t", 2)
+        if len(parts) == 3:
+            added += int(parts[0]) if parts[0].isdigit() else 0
+            removed += int(parts[1]) if parts[1].isdigit() else 0
+            files.append(parts[2])
+    return files, added, removed
+
+
+def office_tests(folder):
+    """Like job_tests, but a fresh copy has no installed JS packages: skipped then."""
+    found = detect_tests(folder) if os.path.isdir(folder or "") else None
+    if found is None:
+        return None
+    root, command = found
+    if os.path.exists(os.path.join(root, "package.json")) and not os.path.isdir(os.path.join(root, "node_modules")):
+        return None
+    code, output = run_shell(["bash", "-lc", command], root, TEST_TIMEOUT_SECONDS, env=dict(os.environ, CI="1"))
+    return {"tests": "passed" if code == 0 else "failed", "testOutput": command + "\n" + tail_lines(output, 30)}
+
+
+def office_review(task):
+    reviewer = "codex" if task.get("agent") == "claude" else "claude"
+    binary = agent_binary(reviewer)
+    copy = office_copy_root(task)
+    if not binary or not copy or not task.get("base"):
+        return None
+    code, diff = office_git(["-C", copy, "diff", task["base"] + "...HEAD"])
+    if code != 0 or not diff:
+        return None
+    code, output = run_shell([binary] + review_arguments(reviewer, review_prompt(task.get("agent"), task.get("prompt"),
+                                                                                  diff[:120000])),
+                             copy, REVIEW_TIMEOUT_SECONDS)
+    output = output.strip()
+    return {"reviewer": reviewer, "review": output[:6000]} if code == 0 and output else None
+
+
+def office_arguments(task, prompt, resume=None):
+    """Mirrors Office.arguments / reworkArguments (careful policy via the environment)."""
+    if task.get("agent") == "codex":
+        return ["exec", "--sandbox", "workspace-write", "--skip-git-repo-check"] \
+            + (["resume", resume] if resume else []) + [prompt]
+    arguments = ["-p", prompt] + (["--resume", resume, "--fork-session"] if resume else []) \
+        + ["--permission-mode", "acceptEdits"]
+    budget = task.get("budgetUSD")
+    if isinstance(budget, (int, float)) and budget > 0:
+        arguments += ["--max-budget-usd", "%.2f" % budget]
+    return arguments
+
+
+def office_start_process(task, prompt, resume=None):
+    binary = agent_binary(task.get("agent"))
+    folder = task.get("workdir") or task.get("cwd")
+    if not binary or not os.path.isdir(folder or ""):
+        return None, "not found"
+    if resume is not None and not valid_session(resume):
+        return None, "bad session"
+    try:
+        os.makedirs(os.path.dirname(office_log(task)), mode=0o700, exist_ok=True)
+        with open(office_log(task), "w") as log:  # the agent's output: why a run failed
+            process = subprocess.Popen(["nice", "-n", "5", "bash", "-lc", '"$0" "$@"', binary]
+                                       + office_arguments(task, prompt, resume),
+                                       cwd=folder, env=dict(os.environ, **{NIGHT_ENV: task["id"]}),
+                                       stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT)
+    except OSError as error:
+        return None, str(error)
+    return process, None
+
+
+def office_log(task):
+    return os.path.join(BASE_DIR, "office-logs", task["id"] + ".log")
+
+
+def office_failure_reason(task, code):
+    """Mirrors Office.failureReason: the last lines the agent printed."""
+    try:
+        with open(office_log(task), errors="replace") as handle:
+            lines = [line.strip() for line in handle.read().splitlines() if line.strip()]
+    except OSError:
+        lines = []
+    tail = " · ".join(lines[-3:])
+    return "exit %s: %s" % (code, tail[-300:]) if tail else "exit %s" % code
+
+
+def office_result(task, state, **extra):
+    result = {"id": str(uuid.uuid4()), "kind": "office", "task": task["id"], "state": state}
+    result.update({key: value for key, value in extra.items() if value is not None})
+    add_result(result)
+
+
+def office_finish(task, code, stopped_reason=None):
+    """After the agent exits (blocking: tests and review can take minutes).
+    Reports and returns the new state."""
+    office_commit_leftovers(task)
+    files, added, removed = office_changes(task)
+    extra = {"files": files, "added": added, "removed": removed}
+    if code == 0:
+        extra.update(office_tests(task.get("workdir") or task.get("cwd")) or {})
+        if task.get("review"):
+            extra.update(office_review(task) or {})
+        office_result(task, "review", **extra)
+        return "review"
+    office_result(task, "failed", output=stopped_reason or office_failure_reason(task, code), **extra)
+    return "failed"
+
+
+OFFICE_LOCK = threading.Lock()
+OFFICE_SESSIONS = os.path.join(BASE_DIR, "office-sessions.json")
+
+
+def office_update(task_id, change):
+    """Read-modify-write of one task under the lock (the main loop and the
+    finishing thread both write)."""
+    with OFFICE_LOCK:
+        tasks = load_json_list(OFFICE_PATH)
+        for task in tasks:
+            if task.get("id") == task_id:
+                change(task)
+        office_save(tasks)
+        return tasks
+
+
+def remember_office_session(task_id, session_id):
+    """The hook of an Office run notes its session (for the Codex budget)."""
+    if not task_id or not isinstance(session_id, str) or not session_id:
+        return
+    try:
+        with open(OFFICE_SESSIONS) as handle:
+            sessions = json.load(handle)
+        if not isinstance(sessions, dict):
+            sessions = {}
+    except (OSError, ValueError):
+        sessions = {}
+    if sessions.get(task_id) == session_id:
+        return
+    sessions[task_id] = session_id
+    keep = dict(list(sessions.items())[-100:])
+    os.makedirs(BASE_DIR, mode=0o700, exist_ok=True)
+    descriptor, temp = tempfile.mkstemp(prefix="office-sessions.", suffix=".tmp", dir=BASE_DIR)
+    with os.fdopen(descriptor, "w") as handle:
+        json.dump(keep, handle)
+    os.replace(temp, OFFICE_SESSIONS)
+
+
+def office_session(task_id):
+    try:
+        with open(OFFICE_SESSIONS) as handle:
+            return json.load(handle).get(task_id)
+    except (OSError, ValueError, AttributeError):
+        return None
+
+
+def office_decide(task, accept):
+    """Accept (merge into what the project has checked out) or throw away."""
+    repo = office_repo(task.get("cwd") or "") if os.path.isdir(task.get("cwd") or "") else None
+    branch = task.get("branch")
+    if not branch or not repo:
+        task["state"] = "accepted" if accept else "discarded"
+        office_result(task, task["state"])
+        return
+    copy = office_copy_root(task)
+    if accept:
+        office_commit_leftovers(task)
+        code, out = office_git(["-C", repo, "-c", "commit.gpgsign=false", "merge", "--no-ff",
+                                "-m", "%s: %s" % ("Codex" if task.get("agent") == "codex" else "Claude Code",
+                                                  office_title(task)), branch])
+        if code != 0:
+            office_git(["-C", repo, "merge", "--abort"])
+            office_result(task, "acceptFailed", output=(out or "git merge")[:1000])
+            return
+    if copy:
+        office_git(["-C", repo, "worktree", "remove", "--force", copy])
+    office_git(["-C", repo, "branch", "-d" if accept else "-D", branch])
+    task["state"] = "accepted" if accept else "discarded"
+    office_result(task, task["state"])
+
+
+def office_interrupted(tasks):
+    """A task saved as running whose worker is gone: say so, never rerun it."""
+    for task in tasks:
+        if task.get("state") == "running":
+            task["state"] = "failed"
+            office_result(task, "failed", output="interrupted: the server or its worker restarted")
+    return tasks
+
+
+def office_save(tasks):
+    open_ = [task for task in tasks if task.get("state") in ("queued", "running", "review", "failed")]
+    done = [task for task in tasks if task not in open_]
+    save_json_list(OFFICE_PATH, open_ + done[-OFFICE_KEEP:])
+
+
+def office_budget_exceeded(task):
+    """Codex has no prices: stop at the token budget (input + output + cache writes)."""
+    limit = task.get("budgetTokens")
+    if task.get("agent") != "codex" or not isinstance(limit, int) or limit <= 0:
+        return False
+    session = office_session(task.get("id"))
+    if not session:
+        return False
+    try:
+        usage = codex_turn_usage(codex_rollout({"session_id": session}))
+    except Exception:
+        return False
+    used = sum(item.get("input", 0) + item.get("output", 0) + item.get("cacheWrite5m", 0) + item.get("cacheWrite1h", 0)
+               for item in usage or [])
+    return used > limit
+
+
+def next_heavy(queue, nights, busy, running, now, office=()):
+    """What may start now, if anything: ("job", job), ("office", task) or
+    ("night", job). One heavy thing at a time -- tests, a review, an Office
+    task or a night agent -- since they share the server's memory. Tests go
+    first, then the Office; a due night job waits for both."""
     if busy or running:
         return None
     if queue:
         return "job", queue[0]
+    for task in office:
+        if task.get("state") == "queued":
+            return "office", task
     for job in nights:
         if night_due(job, now):
             return "night", job
     return None
+
+
+def office_take(job, office, running):
+    """An Office job from the Mac, applied to the task list (under OFFICE_LOCK)."""
+    kind = job.get("kind")
+    if kind == "office":
+        if not any(task.get("id") == job["id"] for task in office):
+            office.append({"id": job["id"], "agent": job.get("agent") or "claude", "cwd": job.get("cwd"),
+                           "prompt": job.get("prompt") or "", "review": bool(job.get("review")),
+                           "budgetUSD": job.get("budgetUSD"), "budgetTokens": job.get("budgetTokens"),
+                           "state": "queued", "created": time.time()})
+        return
+    task = next((item for item in office if item.get("id") == job.get("target")), None)
+    if task is None:
+        return
+    if kind == "officeRework" and task.get("state") in ("review", "failed"):
+        task["rework"] = {"prompt": job.get("prompt") or "", "resume": job.get("resume")}
+        task["budgetUSD"], task["budgetTokens"] = job.get("budgetUSD"), job.get("budgetTokens")
+        task["review"] = bool(job.get("review"))
+        task["state"] = "queued"
+    elif kind in ("officeAccept", "officeDiscard") and task.get("state") in ("review", "failed"):
+        office_decide(task, kind == "officeAccept")
+    elif kind == "cancel":
+        if task.get("state") == "queued":
+            task["state"] = "discarded"
+        elif task["id"] in running:
+            task["stopReason"] = "stopped"
+            running[task["id"]][0].terminate()
 
 
 def run_worker():
@@ -1335,10 +1657,14 @@ def run_worker():
     except OSError:
         return 0
     running = {}
+    office_running = {}
     busy = threading.Event()
     seen = load_json_list(SEEN_PATH)
     received = []
     save_json_list(NIGHT_PATH, interrupted_nights(load_json_list(NIGHT_PATH)))
+    with OFFICE_LOCK:
+        office_save(office_interrupted(load_json_list(OFFICE_PATH)))
+    budget_checked = 0
 
     def work(job):
         try:
@@ -1349,6 +1675,15 @@ def run_worker():
         result.update({"id": job["id"], "kind": job["kind"]})
         add_result(result)
         save_json_list(QUEUE_PATH, [item for item in load_json_list(QUEUE_PATH) if item.get("id") != job["id"]])
+        busy.clear()
+
+    def finish_office(task, code, reason):
+        try:
+            state = office_finish(task, code, reason)
+        except Exception as error:
+            state = "failed"
+            office_result(task, "failed", output=str(error))
+        office_update(task["id"], lambda item: item.update(state=state, rework=None, stopReason=None))
         busy.clear()
 
     started = time.time()
@@ -1369,21 +1704,28 @@ def run_worker():
                 # means the Mac sends it again and it's recognised here.
                 nights = load_json_list(NIGHT_PATH)
                 queue = load_json_list(QUEUE_PATH)
-                for job in jobs:
-                    if job["id"] in seen:
-                        continue
-                    if job.get("kind") == "night":
-                        job["state"] = "waiting"
-                        nights.append(job)
-                        add_result({"id": job["id"], "kind": "night", "state": "queued"})
-                    elif job.get("kind") == "cancel":
-                        for item in nights:
-                            if item.get("id") == job.get("target") and item.get("state") in ("waiting", "running"):
-                                item["state"] = "cancelled"
-                                if item["id"] in running:
-                                    running[item["id"]][0].terminate()
-                    else:
-                        queue.append(job)
+                with OFFICE_LOCK:
+                    office = load_json_list(OFFICE_PATH)
+                    office_ids = {task.get("id") for task in office}
+                    for job in jobs:
+                        if job["id"] in seen:
+                            continue
+                        kind = job.get("kind") or ""
+                        if kind == "night":
+                            job["state"] = "waiting"
+                            nights.append(job)
+                            add_result({"id": job["id"], "kind": "night", "state": "queued"})
+                        elif kind.startswith("office") or (kind == "cancel" and job.get("target") in office_ids):
+                            office_take(job, office, office_running)
+                        elif kind == "cancel":
+                            for item in nights:
+                                if item.get("id") == job.get("target") and item.get("state") in ("waiting", "running"):
+                                    item["state"] = "cancelled"
+                                    if item["id"] in running:
+                                        running[item["id"]][0].terminate()
+                        else:
+                            queue.append(job)
+                    office_save(office)
                 save_json_list(NIGHT_PATH, nights)
                 save_json_list(QUEUE_PATH, queue)
                 seen = (seen + [job["id"] for job in jobs if job["id"] not in seen])[-SEEN_KEEP:]
@@ -1391,10 +1733,28 @@ def run_worker():
                 received = [job["id"] for job in jobs]
             nights = load_json_list(NIGHT_PATH)
             queue = load_json_list(QUEUE_PATH)
-            heavy = next_heavy(queue, nights, busy.is_set(), running, now)
+            office = load_json_list(OFFICE_PATH)
+            heavy = next_heavy(queue, nights, busy.is_set(), running or office_running, now, office)
             if heavy and heavy[0] == "job":
                 busy.set()
                 threading.Thread(target=work, args=(heavy[1],), daemon=True).start()
+            elif heavy and heavy[0] == "office":
+                task = heavy[1]
+                rework = task.get("rework") or {}
+                error = None if task.get("branch") or task.get("workdir") else office_prepare(task)
+                process = None
+                if error is None:
+                    process, error = office_start_process(task, rework.get("prompt") or task.get("prompt") or "",
+                                                          rework.get("resume"))
+                if process is None:
+                    office_result(task, "failed", output=error)
+                    fields = {"state": "failed"}
+                else:
+                    office_running[task["id"]] = (process, now)
+                    office_result(task, "running")
+                    fields = {"state": "running"}
+                fields.update({key: task.get(key) for key in ("branch", "base", "workdir")})
+                office_update(task["id"], lambda item: item.update(fields))
             elif heavy:
                 job = heavy[1]
                 process, error = start_night_job(job)
@@ -1405,6 +1765,23 @@ def run_worker():
                     job["state"] = "running"
                     running[job["id"]] = (process, now)
                     add_result({"id": job["id"], "kind": "night", "state": "running"})
+            check_budget = now - budget_checked > 30
+            if check_budget:
+                budget_checked = now
+            for task_id, (process, since) in list(office_running.items()):
+                task = next((item for item in load_json_list(OFFICE_PATH) if item.get("id") == task_id), {"id": task_id})
+                if process.poll() is None and now - since > NIGHT_TIMEOUT_SECONDS:
+                    task["stopReason"] = "stopped after 3 hours"
+                    office_update(task_id, lambda item: item.update(stopReason="stopped after 3 hours"))
+                    process.terminate()
+                elif process.poll() is None and check_budget and office_budget_exceeded(task):
+                    office_update(task_id, lambda item: item.update(stopReason="over budget"))
+                    process.terminate()
+                if process.poll() is not None:
+                    del office_running[task_id]
+                    busy.set()  # tests and the review run next, in the same slot
+                    code = process.returncode
+                    threading.Thread(target=finish_office, args=(task, code, task.get("stopReason")), daemon=True).start()
             for job_id, (process, since) in list(running.items()):
                 if process.poll() is None and now - since > NIGHT_TIMEOUT_SECONDS:
                     process.terminate()
@@ -1420,12 +1797,14 @@ def run_worker():
                            + [job for job in nights if job.get("state") not in ("waiting", "running")][-20:])
         except Exception:  # one bad turn (a full disk, a broken file) must not end the worker
             nights, queue = load_json_list(NIGHT_PATH), load_json_list(QUEUE_PATH)
+            office = load_json_list(OFFICE_PATH)
         try:
             activity = os.path.getmtime(ACTIVITY_STAMP)
         except OSError:
             activity = started
-        waiting = any(job.get("state") in ("waiting", "running") for job in nights)
-        if not waiting and not queue and not busy.is_set() and not running \
+        waiting = any(job.get("state") in ("waiting", "running") for job in nights) \
+            or any(task.get("state") in ("queued", "running") for task in office)
+        if not waiting and not queue and not busy.is_set() and not running and not office_running \
                 and not load_json_list(RESULTS_PATH) and now - max(activity, started) > WORKER_IDLE_SECONDS:
             return 0
         time.sleep(3 if jobs is not None else 15)
@@ -2048,21 +2427,26 @@ def is_ours(entry):
 
 
 def hooks_table(config, agent):
-    if agent == "claude":
-        table = config.get("hooks")
-        return table if isinstance(table, dict) else {}
-    return config
+    """Claude keeps hooks under "hooks"; so does Codex since 0.14x. Older Codex
+    hooks.json was the table itself (event names at the top level)."""
+    table = config.get("hooks")
+    if isinstance(table, dict):
+        return table
+    if agent == "codex":
+        return {key: value for key, value in config.items() if key in KNOWN_EVENTS or isinstance(value, list)}
+    return {}
 
 
 def with_hooks_table(config, agent, table):
-    if agent == "claude":
-        config = dict(config)
-        if table:
-            config["hooks"] = table
-        else:
-            config.pop("hooks", None)
-        return config
-    return table
+    config = dict(config)
+    if agent == "codex":
+        # Drop the old top-level layout: new Codex refuses unknown top-level keys.
+        config = {key: value for key, value in config.items() if not (key in KNOWN_EVENTS or isinstance(value, list))}
+    if table:
+        config["hooks"] = table
+    else:
+        config.pop("hooks", None)
+    return config
 
 
 def without_ours(table):
@@ -2277,6 +2661,10 @@ def main(argv):
         return 0
     if "--codex-reset" in argv:
         sys.stdout.write(json.dumps(codex_reset()) + "\n")
+        return 0
+    if "--start-worker" in argv:
+        # The Mac queued a job for this server: make sure someone takes it.
+        start_worker()
         return 0
     if "--worker" in argv:
         try:

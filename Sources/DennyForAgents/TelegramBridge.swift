@@ -33,6 +33,25 @@ final class TelegramBridge: ObservableObject {
     /// Main thread: the user replied to a "done" message — the task, their
     /// text and the reply's message id (to answer under it).
     var onReply: ((PhoneReplies.Task, String, Int64) -> Void)?
+    /// Main thread: an Office button — "oa" accept / "ox" throw away (payload:
+    /// task id), "ot" who-and-where for /task (payload: key:place:agent).
+    var onOfficeAction: ((String, String, Int64) -> Void)?
+    /// Main thread: a reply to an Office report — the task id and the remarks.
+    var onOfficeRework: ((String, String, Int64) -> Void)?
+    /// Main thread: /task or /board from the paired user — the command, the rest
+    /// of the text and the message id.
+    var onCommand: ((String, String, Int64) -> Void)?
+    /// Office report message id -> task id (newest, saved).
+    private var officeMessages: [String: String] = (UserDefaults.standard.dictionary(forKey: "telegramOffice") as? [String: String]) ?? [:] {
+        didSet {
+            if officeMessages.count > 200 {
+                for key in officeMessages.keys.sorted(by: { (Int64($0) ?? 0) < (Int64($1) ?? 0) }).prefix(officeMessages.count - 200) {
+                    officeMessages[key] = nil
+                }
+            }
+            UserDefaults.standard.set(officeMessages, forKey: "telegramOffice")
+        }
+    }
 
     private var token: String?
     private var polling = false
@@ -56,6 +75,7 @@ final class TelegramBridge: ObservableObject {
 
     func start() {
         if token != nil { startPolling() }
+        if isConnected { setCommands() }
     }
 
     // MARK: - Setup
@@ -139,6 +159,41 @@ final class TelegramBridge: ObservableObject {
         }
     }
 
+    /// An Office report; a reply to it reworks the task, the buttons decide.
+    func sendOfficeReport(_ text: String, task: String, buttons: Bool) {
+        guard isConnected, let chat = settings.chatId else { return }
+        var params = target(chat).merging(["text": String(text.prefix(4000))]) { $1 }
+        if buttons {
+            params["reply_markup"] = ["inline_keyboard": [[
+                ["text": L.officeAccept, "callback_data": "oa:" + task],
+                ["text": L.officeDiscard, "callback_data": "ox:" + task]
+            ]]]
+        }
+        call("sendMessage", params: params) { [weak self] result in
+            guard let messageId = (result as? [String: Any])?["message_id"] as? Int64 else { return }
+            self?.officeMessages[String(messageId)] = task
+        }
+    }
+
+    /// A question with buttons (one row of choices per entry), under the user's message.
+    func sendChoices(_ text: String, rows: [[(String, String)]], replyTo message: Int64) {
+        guard isConnected, let chat = settings.chatId else { return }
+        let keyboard = rows.map { row in row.map { ["text": $0.0, "callback_data": $0.1] } }
+        call("sendMessage", params: target(chat).merging(["text": text, "reply_to_message_id": message,
+                                                          "reply_markup": ["inline_keyboard": keyboard]]) { $1 })
+    }
+
+    func clearButtons(_ message: Int64) {
+        guard let chat = settings.chatId else { return }
+        call("editMessageReplyMarkup", params: ["chat_id": chat, "message_id": message, "reply_markup": ["inline_keyboard": [Any]()]])
+    }
+
+    /// The bot's menu: /task and /board.
+    private func setCommands() {
+        call("setMyCommands", params: ["commands": [["command": "task", "description": L.officeTgTaskCommand],
+                                                    ["command": "board", "description": L.officeTgBoardCommand]]])
+    }
+
     /// An answer under the user's own message.
     func answer(_ message: Int64, text: String) {
         guard isConnected, let chat = settings.chatId else { return }
@@ -199,6 +254,10 @@ final class TelegramBridge: ObservableObject {
             DispatchQueue.main.async {
                 if let repliedTo, let messageId {
                     self.reply(chatId: chatId, userId: from?["id"] as? Int64, to: repliedTo, message: messageId, text: text)
+                } else if let messageId, text.hasPrefix("/"), self.isConnected, chatId == self.settings.chatId,
+                          self.settings.userId == nil || from?["id"] as? Int64 == self.settings.userId,
+                          let command = Office.command(text) {
+                    self.onCommand?(command.name, command.rest, messageId)
                 } else {
                     self.pair(chatId: chatId, threadId: thread, userId: from?["id"] as? Int64, name: name, text: text)
                 }
@@ -215,6 +274,11 @@ final class TelegramBridge: ObservableObject {
                 self.call("answerCallbackQuery", params: ["callback_query_id": queryId])
                 return
             }
+            if ["oa:", "ox:", "ot:"].contains(where: { data.hasPrefix($0) }), let messageId = message?["message_id"] as? Int64 {
+                self.call("answerCallbackQuery", params: ["callback_query_id": queryId])
+                self.onOfficeAction?(String(data.prefix(2)), String(data.dropFirst(3)), messageId)
+                return
+            }
             let decision: ApprovalDecision = data.hasPrefix("a:") ? .allow : .deny
             let id = String(data.dropFirst(2))
             let known = self.locked { self.messages[id] != nil }
@@ -227,6 +291,10 @@ final class TelegramBridge: ObservableObject {
     /// Only the paired chat and person; only replies to a "done" message.
     private func reply(chatId: Int64, userId: Int64?, to repliedTo: Int64, message: Int64, text: String) {
         guard chatId == settings.chatId, settings.userId == nil || userId == settings.userId else { return }
+        if let office = officeMessages[String(repliedTo)] {
+            onOfficeRework?(office, text, message)
+            return
+        }
         // In a group, people reply to each other too: stay quiet unless it's to the bot's own message.
         guard let task = book.task(for: repliedTo) else {
             if chatId > 0 { answer(message, text: L.phoneReplyUnknown) }
@@ -245,6 +313,7 @@ final class TelegramBridge: ObservableObject {
         settings.chatName = name
         pairingCode = nil
         send(L.phonePaired, force: true)
+        setCommands()
     }
 
     private func locked<T>(_ body: () -> T) -> T {

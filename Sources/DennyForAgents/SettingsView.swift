@@ -3,7 +3,7 @@ import AppKit
 import SwiftUI
 
 enum SettingsSection: String, CaseIterable, Identifiable {
-    case agents, servers, load, safetyNet, phone, nightShift, notch, cards, alerts, language, privacy, about
+    case agents, servers, load, safetyNet, phone, office, nightShift, notch, cards, alerts, language, privacy, about
 
     var id: String { rawValue }
 
@@ -14,6 +14,7 @@ enum SettingsSection: String, CaseIterable, Identifiable {
         case .load: return "speedometer"
         case .safetyNet: return "lifepreserver"
         case .phone: return "iphone"
+        case .office: return "briefcase"
         case .nightShift: return "moon.stars"
         case .notch: return "rectangle.topthird.inset.filled"
         case .cards: return "square.grid.2x2"
@@ -71,6 +72,19 @@ final class SettingsModel: ObservableObject {
     var safetySnapshots: () -> [SafetyNetNotice] = { [] }
     var undoSnapshot: (SafetyNetNotice) -> Void = { _ in }
     var clearSnapshots: () -> Void = {}
+    var officeTasks: () -> [OfficeTask] = { [] }
+    /// agent nil: Denny decides; host nil: this Mac.
+    var addOfficeTask: (_ prompt: String, _ agent: AgentKind?, _ folder: String, _ host: String?) -> Void = { _, _, _, _ in }
+    var reworkOfficeTask: (_ id: String, _ remarks: String) -> Void = { _, _ in }
+    var officeSettings: () -> OfficeSettings = { OfficeSettings() }
+    var updateOfficeSettings: ((inout OfficeSettings) -> Void) -> Void = { _ in }
+    var addOfficeRecurring: (OfficeRecurring) -> Void = { _ in }
+    var removeOfficeRecurring: (String) -> Void = { _ in }
+    var stopOfficeTask: (String) -> Void = { _ in }
+    /// `done(nil)` once merged, else why not.
+    var acceptOfficeTask: (_ id: String, _ done: @escaping (String?) -> Void) -> Void = { _, done in done(nil) }
+    var discardOfficeTask: (String) -> Void = { _ in }
+    var forgetOfficeTask: (String) -> Void = { _ in }
     var nightJobs: () -> [NightJob] = { [] }
     var addNightJob: (NightJob) -> Void = { _ in }
     var removeNightJob: (String) -> Void = { _ in }
@@ -171,6 +185,17 @@ struct SettingsView: View {
     @State private var sshMessages: [String: String] = [:]
     @State private var sshInstalling: Set<String> = []
     @State private var sshRemoving: SettingsModel.SSHRow?
+    @State private var officeAgent: AgentKind? = nil
+    @State private var officeHost = ""
+    @State private var officeFolder = ""
+    @State private var officePrompt = ""
+    @State private var officeError: String?
+    @State private var officeReworkId: String?
+    @State private var officeRemarks = ""
+    @State private var officeRepeat = false
+    @State private var officeWeekday = 0
+    @State private var officeHour = 10
+    @State private var officeExpanded: Set<String> = []
     @State private var nightAgent: AgentKind = .claude
     /// "" is this Mac, otherwise a server's name.
     @State private var nightHost = ""
@@ -202,9 +227,11 @@ struct SettingsView: View {
                     Button {
                         model.section = section
                     } label: {
+                        // The row shares its width: every section fits however many there are.
                         Image(systemName: section.symbol)
                             .font(.system(size: 12, weight: .semibold))
-                            .frame(width: 30, height: 28)
+                            .frame(maxWidth: .infinity, minHeight: 28)
+                            .contentShape(Rectangle())
                             .foregroundColor(model.section == section ? .black : .white.opacity(0.75))
                             .background(Capsule().fill(model.section == section ? Color(red: 0.55, green: 0.9, blue: 0.55) : .clear))
                     }
@@ -225,6 +252,7 @@ struct SettingsView: View {
             }
             .padding(4)
             .background(Capsule().fill(Color.white.opacity(0.07)))
+            .padding(.horizontal, 10)
             .zIndex(1)
             ScrollView {
                 VStack(alignment: .leading, spacing: 14) {
@@ -234,6 +262,7 @@ struct SettingsView: View {
                     case .load: load
                     case .safetyNet: safetyNet
                     case .phone: phone
+                    case .office: office
                     case .nightShift: nightShift
                     case .notch: notch
                     case .cards: cards
@@ -785,6 +814,258 @@ struct SettingsView: View {
             }
         }
         Text(L.nightFooter).font(.caption).foregroundColor(.secondary)
+    }
+
+    // MARK: - Office
+
+    @ViewBuilder private var office: some View {
+        PanelCard(L.officeNewTask) {
+            Picker(L.nightAgent, selection: $officeAgent) {
+                Text(L.officeAuto).tag(AgentKind?.none)
+                ForEach(AgentKind.allCases, id: \.self) { agent in Text(agent.displayName).tag(AgentKind?.some(agent)) }
+            }
+            let hosts = model.knownHosts()
+            if !hosts.isEmpty {
+                Picker(L.nightWhere, selection: $officeHost) {
+                    Text(L.nightThisMac).tag("")
+                    ForEach(hosts, id: \.self) { host in Text(host).tag(host) }
+                }
+                .onChange(of: officeHost) { host in
+                    officeFolder = model.recentFolder(host.isEmpty ? nil : host) ?? ""
+                }
+            }
+            if officeHost.isEmpty {
+                HStack {
+                    Text(officeFolder.isEmpty ? L.nightNoFolder : (officeFolder as NSString).abbreviatingWithTildeInPath)
+                        .font(.system(size: 11, design: .monospaced))
+                        .lineLimit(1)
+                        .truncationMode(.head)
+                    Spacer()
+                    Button(L.nightChooseFolder) { chooseFolder(into: $officeFolder) }
+                }
+            } else {
+                TextField(L.nightServerFolder, text: $officeFolder)
+                    .font(.system(size: 11, design: .monospaced))
+            }
+            TextEditor(text: $officePrompt)
+                .font(.system(size: 12))
+                .frame(height: 70)
+                .overlay(RoundedRectangle(cornerRadius: 6).stroke(Color.white.opacity(0.15)))
+            Toggle(L.officeRepeat, isOn: $officeRepeat)
+            if officeRepeat {
+                HStack {
+                    Picker("", selection: $officeWeekday) {
+                        Text(L.officeEveryDay).tag(0)
+                        ForEach(1...7, id: \.self) { day in Text(Calendar.current.weekdaySymbols[day - 1]).tag(day) }
+                    }
+                    .labelsHidden()
+                    Stepper(L.officeAtHour(officeHour), value: $officeHour, in: 0...23)
+                }
+            }
+            Button(officeRepeat ? L.officeAddRecurring : L.officeGive) { giveOfficeTask() }
+                .disabled(officeFolder.trimmingCharacters(in: .whitespaces).isEmpty
+                          || officePrompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+        }
+        .onAppear { if officeFolder.isEmpty { officeFolder = model.recentFolder(nil) ?? "" } }
+        if let officeError {
+            Text(L.officeAcceptFailed(officeError)).font(.caption).foregroundColor(.red).lineLimit(4)
+        }
+        let tasks = model.officeTasks()
+        ForEach(OfficeTask.Column.allCases, id: \.self) { column in
+            let cards = tasks.filter { $0.column == column }.sorted { $0.createdAt > $1.createdAt }
+            if !cards.isEmpty {
+                PanelCard(L.officeColumn(column) + " · \(cards.count)") {
+                    ForEach(cards) { task in officeCard(task) }
+                }
+            }
+        }
+        if tasks.isEmpty { Text(L.officeEmpty).font(.callout).foregroundColor(.secondary) }
+        officeRecurringCard
+        officeSettingsCard
+        Text(L.officeFooter).font(.caption).foregroundColor(.secondary)
+    }
+
+    private func giveOfficeTask() {
+        let host = officeHost.isEmpty ? nil : officeHost
+        if officeRepeat {
+            model.addOfficeRecurring(OfficeRecurring(prompt: officePrompt.trimmingCharacters(in: .whitespacesAndNewlines),
+                                                     agent: officeAgent, folder: officeFolder.trimmingCharacters(in: .whitespaces),
+                                                     host: host, weekday: officeWeekday == 0 ? nil : officeWeekday, hour: officeHour))
+        } else {
+            model.addOfficeTask(officePrompt, officeAgent, officeFolder, host)
+        }
+        officePrompt = ""
+        model.objectWillChange.send()
+    }
+
+    @ViewBuilder private func officeCard(_ task: OfficeTask) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text(task.title).font(.system(size: 12, weight: .medium)).lineLimit(2)
+            Text(([task.agent.shortName, (task.folder as NSString).lastPathComponent] + (task.host.map { [$0] } ?? [])
+                  + [officeStatus(task)]).joined(separator: " · "))
+                .font(.caption)
+                .foregroundColor(task.state.isFailure ? .orange : .secondary)
+                .lineLimit(2)
+            if task.column == .review || task.column == .done {
+                if let summary = task.report?.summary, !summary.isEmpty {
+                    Text(summary)
+                        .font(.system(size: 11))
+                        .lineLimit(officeExpanded.contains(task.id) ? nil : 3)
+                        .onTapGesture {
+                            if officeExpanded.contains(task.id) { officeExpanded.remove(task.id) } else { officeExpanded.insert(task.id) }
+                        }
+                }
+                if let stats = OfficeTexts.stats(task) {
+                    Text(stats).font(.caption).foregroundColor(task.report?.tests == "failed" ? .orange : .secondary)
+                }
+                if let reviewer = task.report?.reviewer, let review = task.report?.review {
+                    let findings = task.report?.findings ?? 0
+                    Text(findings == 0 ? L.officeReviewClean(reviewer.displayName) : L.officeReviewFindings(reviewer.displayName, findings))
+                        .font(.caption)
+                        .foregroundColor(findings == 0 ? .green : .orange)
+                    if findings > 0, officeExpanded.contains(task.id) {
+                        Text(review).font(.system(size: 11)).foregroundColor(.secondary)
+                    }
+                }
+                if task.column == .review, task.branch == nil, task.host == nil, !task.state.isFailure {
+                    Text(L.officeNoGit).font(.caption2).foregroundColor(.secondary)
+                }
+            }
+            if officeReworkId == task.id {
+                TextEditor(text: $officeRemarks)
+                    .font(.system(size: 12))
+                    .frame(height: 50)
+                    .overlay(RoundedRectangle(cornerRadius: 6).stroke(Color.white.opacity(0.15)))
+            }
+            HStack(spacing: 8) {
+                switch task.column {
+                case .inbox:
+                    Button(L.officeRemove) { act { model.stopOfficeTask(task.id) } }
+                case .working:
+                    Button(L.officeStop) { act { model.stopOfficeTask(task.id) } }
+                case .review:
+                    if officeReworkId == task.id {
+                        Button(L.officeSendRework) {
+                            model.reworkOfficeTask(task.id, officeRemarks)
+                            officeReworkId = nil
+                            officeRemarks = ""
+                            model.objectWillChange.send()
+                        }
+                        .disabled(officeRemarks.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                        Button(L.officeCancel) { officeReworkId = nil }
+                    } else {
+                        if task.branch != nil || task.host != nil {
+                            Button(L.officeAccept) {
+                                officeError = nil
+                                model.acceptOfficeTask(task.id) { error in
+                                    officeError = error
+                                    model.objectWillChange.send()
+                                }
+                            }
+                        }
+                        Button(L.officeRework) {
+                            officeRemarks = ""
+                            officeReworkId = task.id
+                        }
+                        Button(task.branch != nil || task.host != nil ? L.officeDiscard : L.officeRemove) {
+                            act { model.discardOfficeTask(task.id) }
+                        }
+                    }
+                case .done:
+                    Button(L.officeRemove) { act { model.forgetOfficeTask(task.id) } }
+                }
+            }
+            .controlSize(.small)
+        }
+        .padding(.vertical, 2)
+    }
+
+    @ViewBuilder private var officeRecurringCard: some View {
+        let items = model.officeSettings().recurring
+        if !items.isEmpty {
+            PanelCard(L.officeRecurringTitle) {
+                ForEach(items) { item in
+                    HStack(alignment: .top, spacing: 8) {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(item.prompt).font(.system(size: 12)).lineLimit(2)
+                            Text(([item.agent?.shortName ?? L.officeAuto, (item.folder as NSString).lastPathComponent]
+                                  + (item.host.map { [$0] } ?? [])
+                                  + [(item.weekday.map { Calendar.current.weekdaySymbols[$0 - 1] } ?? L.officeEveryDay)
+                                     + " · " + L.officeAtHour(item.hour)]).joined(separator: " · "))
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                        }
+                        Spacer()
+                        Button {
+                            act { model.removeOfficeRecurring(item.id) }
+                        } label: { Image(systemName: "xmark.circle.fill") }
+                        .buttonStyle(.plain)
+                        .foregroundColor(.secondary)
+                    }
+                }
+            }
+        }
+    }
+
+    @ViewBuilder private var officeSettingsCard: some View {
+        let current = model.officeSettings()
+        PanelCard(L.officeHowTitle) {
+            Toggle(L.officeReviewToggle, isOn: Binding(get: { current.review },
+                                                       set: { value in act { model.updateOfficeSettings { $0.review = value } } }))
+            HStack {
+                Text(L.officeClaudeBudget)
+                Spacer()
+                TextField("—", value: Binding(get: { current.claudeBudget }, set: { value in
+                    act { model.updateOfficeSettings { $0.claudeBudget = value.flatMap { $0 > 0 ? $0 : nil } } }
+                }), format: .number)
+                    .frame(width: 70)
+                    .multilineTextAlignment(.trailing)
+            }
+            HStack {
+                Text(L.officeCodexBudget)
+                Spacer()
+                TextField("—", value: Binding(get: { current.codexBudgetK }, set: { value in
+                    act { model.updateOfficeSettings { $0.codexBudgetK = value.flatMap { $0 > 0 ? $0 : nil } } }
+                }), format: .number)
+                    .frame(width: 70)
+                    .multilineTextAlignment(.trailing)
+            }
+            Toggle(L.officeStandupToggle, isOn: Binding(get: { current.standupHour != nil }, set: { value in
+                act { model.updateOfficeSettings { $0.standupHour = value ? 9 : nil } }
+            }))
+            if let hour = current.standupHour {
+                Stepper(L.officeAtHour(hour), value: Binding(get: { hour }, set: { value in
+                    act { model.updateOfficeSettings { $0.standupHour = value } }
+                }), in: 0...23)
+            }
+            Text(L.officeHowFooter).font(.caption).foregroundColor(.secondary)
+        }
+    }
+
+    private func act(_ body: () -> Void) {
+        body()
+        model.objectWillChange.send()
+    }
+
+    private func officeStatus(_ task: OfficeTask) -> String {
+        switch task.state {
+        case .queued: return L.officeWaiting
+        case .working(let since): return L.nightRunning(Fmt.countdown(Date().timeIntervalSince(since)))
+        case .review(let at): return L.officeReadyAt(Fmt.time(at))
+        case .failed(_, let reason): return L.nightFailedShort(reason)
+        case .accepted: return L.officeAccepted
+        case .discarded: return L.officeDiscarded
+        }
+    }
+
+    private func chooseFolder(into folder: Binding<String>) {
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.allowsMultipleSelection = false
+        if !folder.wrappedValue.isEmpty { panel.directoryURL = URL(fileURLWithPath: folder.wrappedValue) }
+        NSApp.activate(ignoringOtherApps: true)
+        if panel.runModal() == .OK, let url = panel.url { folder.wrappedValue = url.path }
     }
 
     private func nightStatus(_ job: NightJob) -> String {

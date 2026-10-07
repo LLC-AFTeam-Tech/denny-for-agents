@@ -5,6 +5,9 @@ import Foundation
 public struct RemoteJob: Codable, Equatable, Sendable, Identifiable {
     public enum Kind: String, Codable, Sendable {
         case tests, review, lines, night, cancel
+        /// Office: start a task (its id is the task's), carry on with remarks,
+        /// accept (merge) or throw away — the last three name the task in `target`.
+        case office, officeRework, officeAccept, officeDiscard
     }
 
     public var id: String
@@ -23,6 +26,10 @@ public struct RemoteJob: Codable, Equatable, Sendable, Identifiable {
     public var target: String?
     /// Night: the session a reply from the phone goes on with.
     public var resume: String?
+    /// Office: review by the other agent, and the budget.
+    public var review: Bool?
+    public var budgetUSD: Double?
+    public var budgetTokens: Int?
 
     public init(id: String = UUID().uuidString, kind: Kind, cwd: String? = nil, files: [String]? = nil,
                 author: AgentKind? = nil, task: String? = nil, agent: AgentKind? = nil, prompt: String? = nil,
@@ -64,6 +71,14 @@ public struct RemoteJobResult: Codable, Equatable, Sendable {
     public var added: Int?
     public var removed: Int?
     public var reviewer: AgentKind?
+    /// Office: the task this is about (the result's own id is unique, so the
+    /// same task can report "review" again after a rework), and the report.
+    public var task: String?
+    public var files: [String]?
+    public var tests: String?
+    public var testOutput: String?
+    public var review: String?
+    public var tokens: Int?
 
     public init(id: String, kind: RemoteJob.Kind, state: String, command: String? = nil, output: String? = nil,
                 duration: Double? = nil, added: Int? = nil, removed: Int? = nil, reviewer: AgentKind? = nil) {

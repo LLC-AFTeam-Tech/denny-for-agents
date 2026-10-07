@@ -20,6 +20,8 @@ final class SSHTunnelManager {
     var onChange: () -> Void = {}
     private(set) var servers: [SSHServer] = SSHTunnelManager.load()
     private(set) var states: [String: State] = [:]
+    /// The name a server reports itself by (its hostname) -> our server id.
+    private var hostNames: [String: String] = [:]
     private var tunnels: [String: Tunnel] = [:]
     private let localSetup: () -> (port: UInt16, token: String)?
     private var wakeObserver: NSObjectProtocol?
@@ -110,6 +112,14 @@ final class SSHTunnelManager {
         run(SSHLink.installCommand(port: port, token: setup.token), on: server, input: hook) { status, output in
             done(status == 0 ? nil : L.sshInstallFailed(Self.describe(SSHLink.classify(stderr: output))))
         }
+    }
+
+    /// Jobs wait for `host` (as it names itself): start its worker over our
+    /// connection, so they don't wait for the next agent activity there.
+    func wakeWorker(host: String) {
+        guard let id = hostNames[host], currentRemotePort(id) != nil,
+              let server = servers.first(where: { $0.id == id }) else { return }
+        run(SSHLink.startWorkerCommand, on: server) { _, _ in }
     }
 
     func reconnectAll() {
@@ -228,6 +238,7 @@ final class SSHTunnelManager {
         run(SSHLink.reportCommand, on: server) { [weak self] status, output in
             guard status == 0, let line = output.split(whereSeparator: \.isNewline).last,
                   let report = try? JSONDecoder().decode(UsageReport.self, from: Data(line.utf8)) else { return }
+            self?.hostNames[report.host] = server.id
             self?.onReport?(report)
         }
     }

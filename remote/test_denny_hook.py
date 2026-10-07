@@ -2,9 +2,11 @@ import io
 import json
 import os
 import socket
+import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from importlib.machinery import SourceFileLoader
 
@@ -191,6 +193,8 @@ class HookTests(unittest.TestCase):
         self.assertEqual(claude["model"], "opus")
         self.assertEqual(len(claude["hooks"]["PreToolUse"]), 2)
         codex = json.load(open(hook.CONFIG_FILES["codex"]))
+        self.assertEqual(set(codex), {"hooks"})  # Codex 0.14x reads only "hooks" at the top level
+        codex = codex["hooks"]
         self.assertEqual(set(codex), set(hook.EVENTS["codex"]))
         self.assertEqual(codex["PermissionRequest"][0]["hooks"][0]["timeout"], hook.APPROVAL_TIMEOUT_SECONDS)
         self.assertEqual(codex["Stop"][0]["hooks"][0]["timeout"], hook.REPLY_TIMEOUT_SECONDS)
@@ -247,6 +251,16 @@ class HookTests(unittest.TestCase):
         self.assertEqual(hook.main(["denny-hook.py", "--statusline-uninstall"]), 0)
         self.assertEqual(json.load(open(path))["statusLine"], mine)
         self.assertEqual(json.load(open(path))["hooks"], hooks)
+
+    def test_the_old_codex_layout_is_moved_under_hooks(self):
+        ours = {"hooks": [{"type": "command", "command": "python3 '/x/denny-hook.py' codex", "timeout": 5}]}
+        mine = {"hooks": [{"type": "command", "command": "my-own-script"}]}
+        fixed = hook.merged({"Stop": [ours], "PreToolUse": [mine], "description": "mine"}, "codex")
+        self.assertEqual({"hooks", "description"}, set(fixed))
+        self.assertEqual(2, len(fixed["hooks"]["PreToolUse"]))
+        left = hook.removed(fixed, "codex")
+        self.assertEqual({"hooks", "description"}, set(left))
+        self.assertEqual({"PreToolUse": [mine]}, left["hooks"])  # only the user's own hook stays
 
     def test_install_refuses_unreadable_config(self):
         path = hook.CONFIG_FILES["claude"]
@@ -947,6 +961,217 @@ class PhoneReplyTests(unittest.TestCase):
         self.assertEqual(["resume", "abc-123", "go"], calls[1][-3:])
         self.assertEqual((None, "bad session"), (process, error))
         self.assertEqual(2, len(calls))
+
+
+
+class OfficeWorkerTests(unittest.TestCase):
+    def setUp(self):
+        self.home = tempfile.mkdtemp()
+        hook.HOME = self.home
+        hook.BASE_DIR = os.path.join(self.home, ".denny-for-agents")
+        hook.RESULTS_PATH = os.path.join(hook.BASE_DIR, "job-results.json")
+        hook.OFFICE_PATH = os.path.join(hook.BASE_DIR, "office.json")
+        hook.OFFICE_DIR = os.path.join(hook.BASE_DIR, "office")
+        hook.OFFICE_SESSIONS = os.path.join(hook.BASE_DIR, "office-sessions.json")
+        self.repo = os.path.join(self.home, "project")
+        os.makedirs(os.path.join(self.repo, "web"))
+        with open(os.path.join(self.repo, "web", "a.txt"), "w") as handle:
+            handle.write("a\n")
+        for args in (["init", "-q", "-b", "main"], ["config", "user.email", "t@t"], ["config", "user.name", "T"],
+                     ["add", "-A"], ["commit", "-qm", "init"]):
+            subprocess.run(["git", "-C", self.repo] + args, check=True, capture_output=True)
+
+    def task(self, folder=None, **extra):
+        task = {"id": "1234abcd-0000-0000-0000-000000000000", "agent": "claude", "cwd": folder or self.repo,
+                "prompt": "Add b.txt\nwith care", "state": "queued"}
+        task.update(extra)
+        return task
+
+    def results(self):
+        return hook.load_json_list(hook.RESULTS_PATH)
+
+    def test_a_branch_per_task_then_accept_merges_it(self):
+        task = self.task(os.path.join(self.repo, "web"))
+        self.assertIsNone(hook.office_prepare(task))
+        self.assertEqual("denny/office-1234abcd", task["branch"])
+        self.assertTrue(task["workdir"].endswith(os.sep + "web"))
+        with open(os.path.join(task["workdir"], "b.txt"), "w") as handle:
+            handle.write("b\nc\n")
+        self.assertFalse(os.path.exists(os.path.join(self.repo, "web", "b.txt")))  # the project is untouched
+        self.assertEqual("review", hook.office_finish(task, 0))
+        report = self.results()[-1]
+        self.assertEqual((task["id"], "review", ["web/b.txt"], 2), (report["task"], report["state"], report["files"], report["added"]))
+        hook.office_decide(task, True)
+        self.assertEqual("accepted", task["state"])
+        self.assertTrue(os.path.exists(os.path.join(self.repo, "web", "b.txt")))
+        self.assertFalse(os.path.exists(task["workdir"]))
+        self.assertEqual("accepted", self.results()[-1]["state"])
+
+    def test_discard_throws_the_work_away(self):
+        task = self.task()
+        hook.office_prepare(task)
+        with open(os.path.join(task["workdir"], "b.txt"), "w") as handle:
+            handle.write("b\n")
+        hook.office_decide(task, False)
+        self.assertEqual("discarded", task["state"])
+        self.assertFalse(os.path.exists(task["workdir"]))
+        self.assertFalse(os.path.exists(os.path.join(self.repo, "b.txt")))
+        branches = subprocess.run(["git", "-C", self.repo, "branch"], capture_output=True, text=True).stdout
+        self.assertNotIn("denny/office", branches)
+
+    def test_a_conflict_keeps_the_task_for_review(self):
+        task = self.task()
+        hook.office_prepare(task)
+        with open(os.path.join(task["workdir"], "web", "a.txt"), "w") as handle:
+            handle.write("theirs\n")
+        hook.office_commit_leftovers(task)
+        with open(os.path.join(self.repo, "web", "a.txt"), "w") as handle:
+            handle.write("mine\n")
+        subprocess.run(["git", "-C", self.repo, "commit", "-qam", "mine"], check=True, capture_output=True)
+        hook.office_decide(task, True)
+        self.assertEqual("acceptFailed", self.results()[-1]["state"])
+        self.assertNotEqual("accepted", task.get("state"))
+        status = subprocess.run(["git", "-C", self.repo, "status", "--porcelain"], capture_output=True, text=True).stdout
+        self.assertEqual("", status.strip())  # the merge was aborted cleanly
+
+    def test_a_folder_outside_git_is_used_as_it_is(self):
+        plain = tempfile.mkdtemp()
+        task = self.task(plain)
+        self.assertIsNone(hook.office_prepare(task))
+        self.assertNotIn("branch", task)
+
+    def test_the_agent_runs_in_its_copy_under_the_careful_policy(self):
+        script = os.path.join(self.home, "fake-claude")
+        with open(script, "w") as handle:
+            handle.write("#!/bin/sh\necho \"$DENNY_NIGHT_SHIFT\" > done.txt\n")
+        os.chmod(script, 0o755)
+        original = hook.agent_binary
+        hook.agent_binary = lambda agent: script
+        try:
+            task = self.task()
+            hook.office_prepare(task)
+            process, error = hook.office_start_process(task, task["prompt"])
+            self.assertIsNone(error)
+            process.wait(10)
+        finally:
+            hook.agent_binary = original
+        with open(os.path.join(task["workdir"], "done.txt")) as handle:
+            self.assertEqual(task["id"], handle.read().strip())
+
+    def test_jobs_from_the_mac(self):
+        office = []
+        hook.office_take({"id": "t1", "kind": "office", "agent": "codex", "cwd": "/x", "prompt": "go", "review": True,
+                          "budgetTokens": 5000}, office, {})
+        self.assertEqual(("queued", "codex", True, 5000),
+                         (office[0]["state"], office[0]["agent"], office[0]["review"], office[0]["budgetTokens"]))
+        hook.office_take({"id": "t1", "kind": "office", "cwd": "/x", "prompt": "go"}, office, {})  # resent: once
+        self.assertEqual(1, len(office))
+        hook.office_take({"id": "r1", "kind": "officeRework", "target": "t1", "prompt": "more"}, office, {})
+        self.assertNotIn("rework", office[0])  # not finished yet: nothing to rework
+        office[0]["state"] = "review"
+        hook.office_take({"id": "r2", "kind": "officeRework", "target": "t1", "prompt": "more", "resume": "s-1"}, office, {})
+        self.assertEqual(("queued", {"prompt": "more", "resume": "s-1"}), (office[0]["state"], office[0]["rework"]))
+        hook.office_take({"id": "c1", "kind": "cancel", "target": "t1"}, office, {})
+        self.assertEqual("discarded", office[0]["state"])
+
+    def test_one_heavy_thing_at_a_time_tests_then_office_then_night(self):
+        night = {"id": "n", "state": "waiting", "at": 0}
+        office = [{"id": "o", "state": "queued"}]
+        self.assertEqual("job", hook.next_heavy([{"id": "t"}], [night], False, {}, 10, office)[0])
+        self.assertEqual("office", hook.next_heavy([], [night], False, {}, 10, office)[0])
+        self.assertEqual("night", hook.next_heavy([], [night], False, {}, 10, [])[0])
+        self.assertIsNone(hook.next_heavy([], [night], False, {"o": object()}, 10, office))
+
+    def test_budget_and_rework_arguments(self):
+        claude = hook.office_arguments({"agent": "claude", "budgetUSD": 2}, "go")
+        self.assertEqual(["--max-budget-usd", "2.00"], claude[-2:])
+        self.assertEqual(["exec", "--sandbox", "workspace-write", "--skip-git-repo-check", "resume", "s-1", "more"],
+                         hook.office_arguments({"agent": "codex"}, "more", "s-1"))
+        process, error = hook.office_start_process(self.task(), "go", "--evil")
+        self.assertIsNone(process)
+
+    def test_a_restart_marks_running_tasks_interrupted(self):
+        tasks = hook.office_interrupted([{"id": "a", "state": "running"}, {"id": "b", "state": "review"}])
+        self.assertEqual(["failed", "review"], [task["state"] for task in tasks])
+        self.assertIn("interrupted", self.results()[-1]["output"])
+
+    def test_the_whole_office_round_on_a_server(self):
+        # A fake Mac hands out an Office job, then (after the report) Accept;
+        # a fake agent writes a file. The worker does everything in between.
+        for name in ("SEEN_PATH", "QUEUE_PATH", "NIGHT_PATH", "WORKER_LOCK", "ACTIVITY_STAMP", "CONFIG_PATH"):
+            setattr(hook, name, os.path.join(hook.BASE_DIR, name.lower()))
+        script = os.path.join(self.home, "fake-claude")
+        with open(script, "w") as handle:
+            handle.write("#!/bin/sh\nprintf 'hello\\n' > hello.txt\n")
+        os.chmod(script, 0o755)
+        server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        server.bind(("127.0.0.1", 0))
+        server.listen(8)
+        os.makedirs(hook.BASE_DIR, exist_ok=True)
+        with open(hook.CONFIG_PATH, "w") as handle:
+            json.dump({"port": server.getsockname()[1], "token": "t" * 48}, handle)
+        task_id = "abcd1234-0000-0000-0000-000000000000"
+        outbox = [{"id": task_id, "kind": "office", "agent": "claude", "cwd": self.repo, "prompt": "Say hello"}]
+        states = []
+        def mac():
+            server.settimeout(1)
+            deadline = time.time() + 40
+            while time.time() < deadline:
+                try:
+                    conn, _ = server.accept()
+                except OSError:
+                    continue
+                request = json.loads(hook.read_line(conn, 5))
+                for result in request.get("jobResults") or []:
+                    if result.get("kind") == "office" and result["state"] not in states:
+                        states.append(result["state"])
+                        if result["state"] == "review":
+                            outbox.append({"id": "acc-1", "kind": "officeAccept", "target": task_id})
+                received = set(request.get("jobsReceived") or [])
+                outbox[:] = [job for job in outbox if job["id"] not in received]
+                conn.sendall((json.dumps({"id": request["id"], "jobs": outbox}) + "\n").encode())
+                conn.close()
+                if "accepted" in states:
+                    os.remove(hook.CONFIG_PATH)  # the worker stops on its next turn
+                    return
+        thread = threading.Thread(target=mac, daemon=True)
+        thread.start()
+        original_binary, original_sleep = hook.agent_binary, hook.time.sleep
+        hook.agent_binary = lambda agent: script
+        hook.time.sleep = lambda seconds: original_sleep(0.05)
+        try:
+            hook.run_worker()
+        finally:
+            hook.agent_binary, hook.time.sleep = original_binary, original_sleep
+            server.close()
+        thread.join(5)
+        self.assertEqual(["running", "review", "accepted"], states)
+        with open(os.path.join(self.repo, "hello.txt")) as handle:
+            self.assertEqual("hello", handle.read().strip())
+        log = subprocess.run(["git", "-C", self.repo, "log", "--oneline"], capture_output=True, text=True).stdout
+        self.assertIn("Say hello", log)
+
+    def test_a_failed_run_says_why(self):
+        script = os.path.join(self.home, "fake-claude")
+        with open(script, "w") as handle:
+            handle.write("#!/bin/sh\necho 'Invalid API key' >&2\nexit 1\n")
+        os.chmod(script, 0o755)
+        original = hook.agent_binary
+        hook.agent_binary = lambda agent: script
+        try:
+            task = self.task()
+            hook.office_prepare(task)
+            process, _ = hook.office_start_process(task, "go")
+            process.wait(10)
+        finally:
+            hook.agent_binary = original
+        self.assertEqual("failed", hook.office_finish(task, process.returncode))
+        self.assertEqual("exit 1: Invalid API key", self.results()[-1]["output"])
+
+    def test_the_hook_notes_the_session_of_an_office_run(self):
+        hook.remember_office_session("t1", "s-9")
+        self.assertEqual("s-9", hook.office_session("t1"))
+        self.assertIsNone(hook.office_session("t2"))
 
 
 if __name__ == "__main__":

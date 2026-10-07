@@ -56,6 +56,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         controller.ssh.onChange = { [weak self] in self?.settingsModel.refresh() }
         settingsModel.safetySnapshots = { [weak self] in self?.controller.safetySnapshots ?? [] }
         settingsModel.undoSnapshot = { [weak self] notice in self?.controller.undo(notice) }
+        settingsModel.officeTasks = { [weak self] in self?.controller.office.tasks ?? [] }
+        settingsModel.addOfficeTask = { [weak self] prompt, agent, folder, host in
+            self?.controller.office.add(prompt: prompt, agent: agent, folder: folder, host: host)
+        }
+        settingsModel.reworkOfficeTask = { [weak self] id, remarks in self?.controller.office.rework(id: id, remarks: remarks) }
+        settingsModel.officeSettings = { [weak self] in self?.controller.office.settings ?? OfficeSettings() }
+        settingsModel.updateOfficeSettings = { [weak self] change in self?.controller.office.updateSettings(change) }
+        settingsModel.addOfficeRecurring = { [weak self] item in self?.controller.office.addRecurring(item) }
+        settingsModel.removeOfficeRecurring = { [weak self] id in self?.controller.office.removeRecurring(id: id) }
+        settingsModel.stopOfficeTask = { [weak self] id in self?.controller.office.stop(id: id) }
+        settingsModel.acceptOfficeTask = { [weak self] id, done in self?.controller.office.accept(id: id, done: done) }
+        settingsModel.discardOfficeTask = { [weak self] id in self?.controller.office.discard(id: id) }
+        settingsModel.forgetOfficeTask = { [weak self] id in self?.controller.office.forget(id: id) }
+        controller.onOfficeChange = { [weak self] in self?.settingsModel.objectWillChange.send() }
         settingsModel.nightJobs = { [weak self] in self?.controller.nightJobs ?? [] }
         settingsModel.addNightJob = { [weak self] job in self?.controller.addNightJob(job) }
         settingsModel.removeNightJob = { [weak self] id in self?.controller.removeNightJob(id: id) }
