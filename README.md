@@ -1,198 +1,97 @@
 <div align="center">
 
-<img src="docs/media/demo.gif" width="760" alt="Denny in the MacBook notch watching Claude Code and Codex">
+<img src="docs/media/v0.4.0/agents.webp" width="240" alt="Denny Agents: two connected terminals in the AFTEAM visual style">
 
-# Denny for Agents
+# Denny Agents
 
-**A tiny robot that lives in your MacBook's notch and looks after Claude Code and Codex.**
+**Your agents and everyday Mac tools, right beside the camera.**
 
-He watches your agents work, asks before anything risky runs, saves your files before destructive commands,<br>
-warns you when an agent goes in circles, and cheers when the job is done. Free, open source, and private by design.
+A standalone notch app with a free edition and a separately activated full edition.
 
+![Version 0.4.0](https://img.shields.io/badge/release-0.4.0-78cbbd)
 ![macOS 13+](https://img.shields.io/badge/macOS-13%2B-black?logo=apple)
-![Swift](https://img.shields.io/badge/Swift-5.9-F05138?logo=swift&logoColor=white)
-![Claude Code](https://img.shields.io/badge/Claude%20Code-supported-D97757)
-![Codex](https://img.shields.io/badge/Codex-supported-7A9BFF)
-![License: MIT](https://img.shields.io/badge/code-MIT-green)
+![Apple Silicon](https://img.shields.io/badge/Mac-Apple_Silicon-c8b98b)
 
-[**Download**](../../releases/latest) · [Install](#install) · [Agents on a server](#agents-on-an-ssh-server) · [Privacy](#privacy) · [Русская версия](README.ru.md)
+[**Download 0.4.0**](https://github.com/LLC-AFTeam-Tech/denny-for-agents/releases/tag/v0.4.0) · [**Try the interactive demo**](https://afteam.tech/denny/agents/) · [**Русская версия**](README.ru.md)
 
 </div>
 
----
+## A new everyday workspace
 
-## Only in Denny
+<table>
+<tr>
+<td width="50%" align="center"><img src="docs/media/v0.4.0/music.webp" width="190" alt="Music illustration"><br><strong>Music that stays close</strong><br>Artwork, playback controls and the active media source.</td>
+<td width="50%" align="center"><img src="docs/media/v0.4.0/files.webp" width="190" alt="Files illustration"><br><strong>Copy, keep, share</strong><br>Clipboard cards, a file shelf and AirDrop.</td>
+</tr>
+<tr>
+<td align="center"><img src="docs/media/v0.4.0/day.webp" width="190" alt="Calendar and daily planning illustration"><br><strong>Your day at a glance</strong><br>Calendar, Mac Reminders and weather.</td>
+<td align="center"><img src="docs/media/v0.4.0/agents.webp" width="190" alt="AI agent terminals illustration"><br><strong>Keep track of your agents</strong><br>Claude Code and Codex limits, reset times and event notifications.</td>
+</tr>
+</table>
 
-### 🛡️ The guard
-Every permission request is read before you see it. `rm -rf ~`, `curl … | sh`, `git push --force`, `sudo`, anything touching `~/.ssh` or `.env` — Denny flags it in red, puts **Deny** first and plays a warning sound. Safe requests stay calm and green, so the red ones really stand out.
+## What's new in 0.4.0
 
-### 🛟 The safety net
-Right before an agent runs `rm -rf`, `git reset --hard`, `git clean -f` or `git checkout -- .`, Denny snapshots your files — uncommitted and untracked ones included. Deleted the wrong folder? **Undo** in the notch puts everything back. In a git project the snapshot lives in a hidden ref and never touches your branch, index or stash; files outside git are copied aside. Snapshots are kept for 7 days by default — choose 1, 7 or 30 days and how much space copies may take. Claude Code's own rewind only covers its file edits — not what a shell command wiped out.
+- **Nine free sections:** Overview, agent limits, Notifications, Clipboard, Files, Reminders, Calendar, Music and Weather.
+- **A redesigned notch:** rounded panels, consistent perimeter lighting and a customizable overview with up to five cards.
+- **Agent limits first:** remaining allowance, reset times and colors that move from red to green as available allowance increases. Chats and agent control belong to the full edition.
+- **Notification cards:** app icons, filters, a summary and actions to read or hide entries in the notch feed.
+- **Clipboard cards:** source-app icons when available, type/app filters and a preview of the selected item.
+- **Files and AirDrop:** drag files onto the notch; filter images, documents and archives, then share through macOS.
+- **Mac Reminders:** lists with their colors, due dates and completion controls. Calendar settings bring together Mac calendars, Google through the Mac Calendar account, and Yandex.
+- **Music and weather in the overview:** album artwork, weather conditions and temperature. Media selection accounts for music continuing in Yandex Music while a browser video is paused.
+- **License and updates inside Settings:** activate with a separate Agents key and check the dedicated Agents update channel.
 
-### 🌙 Night shift
-Your limit ran out at 11 pm and renews at 3 am? Queue the task — on the Mac or on a server, where it runs even if your SSH session drops — and Denny starts the agent by himself the moment the limit renews (or at the time you pick) and keeps the Mac awake. Nobody approves at night, so he plays it safe: edits and safe commands go ahead, anything the guard calls dangerous is refused, the safety net snapshots as usual. In the morning a receipt is waiting, and Telegram tells you it's done. For a server job that message comes once the Mac is in touch with that server again: right away with Denny's own SSH connections, otherwise after the tunnel reconnects.
+### See the design
 
-### 🔁 The relay
-Claude hit its plan limit in the middle of a task? Denny offers to hand the work to Codex — or the other way round — and writes the hand-off note for you: what was asked, which files were edited, which commands ran, and the last message. One click copies it, ⌘V continues the task.
+These are screenshots of our **interactive website demo with fictional data**, not recordings of a user's desktop. Illustrations above are promotional artwork. Explore the working demo on [the product page](https://afteam.tech/denny/agents/).
 
-### 🌀 "Going in circles"
-Running the same command for the third time, editing the same file again and again, or busy for twenty minutes without a single change — Denny notices the loop and taps you on the shoulder before it burns your limit.
+| Agent limits | Music |
+| --- | --- |
+| ![Agent limits in the website demo](docs/media/v0.4.0/limits-demo.png) | ![Music in the website demo](docs/media/v0.4.0/music-demo.png) |
+| Clipboard cards | Colored reminder lists |
+| ![Clipboard in the website demo](docs/media/v0.4.0/clipboard-demo.png) | ![Reminders in the website demo](docs/media/v0.4.0/reminders-demo.png) |
 
-## Everything else
+## Free and full editions
 
-**Your agents, live**
-- 🤖 Every Claude Code and Codex session in the notch, step by step: what it reads, edits and runs.
-- ✅ **Allow / Deny / Ask there** right from the notch. If Denny isn't running, agents ask in the terminal as usual — he never blocks them.
-- 🎉 Denny peeks out with a laptop when a task starts and celebrates with a *Task Completed!* when it ends. In between he lives in the notch: looks around, crawls, hides, reacts.
-- 🧾 **Task receipt:** when a task ends — how long it took, files changed (+lines −lines), commands run, tokens and what they'd cost at API prices. One click copies it for a post.
-- ✅ **Is it really done?** Denny runs your project's tests right after the task — on the Mac or on the server where the agent works — (`swift test`, `npm test`, `cargo test`, `pytest`… or your own in `.denny-test`) and shows ✅ or ❌. Failed? One click copies the output for the agent to fix.
-- 👀 **Cross-review:** one click and the other agent reviews what this one just changed — Codex checks Claude, Claude checks Codex — read-only, in the language of your task. Findings show up in the notch, ready to send back to the author.
-- 👆 Swipe two fingers on the open notch to flip between the overview and the stats.
-- ⏱️ A live number by the camera: the current task's timer while an agent works, your tightest limit at rest.
-- 💼 **Office.** Give Claude or Codex a task like you would a colleague — in **Settings → Office** or by telling your Telegram bot `/task add a contact form` (it asks with buttons who and which project). Each task runs in its own git branch and working copy, on the Mac or on a server, so your code stays untouched until you decide. When it's done you get a report: what was done in the agent's words, files and lines, tests, cost, and optionally a review by the other agent. Buttons: **Accept** (the branch is merged), **Rework** (the same agent carries on with your remarks — in Telegram just reply to the report) and **Throw away**. "Denny decides" gives the task to whoever has more of the plan left; there's a per-task budget, recurring tasks ("every Monday at 10…"), a morning stand-up in Telegram and `/board` for the office board. They work under the careful night-shift policy, one task per folder at a time. **Codex 0.146 and later** won't run new hooks until you trust them: after Connect agents, open `codex` once on that machine and allow them with `/hooks` (without it Denny can't see what Codex does).
-- 📱 **Approve from your phone.** Away from the Mac? Requests come to Telegram through your own bot with ✅ Allow / ❌ Deny buttons, risky ones flagged by the guard. Paired by a one-time code, so the bot obeys only you. And you can simply reply to a "✅ done" message — "now add tests" — and the agent carries on with the same task: while you're away, in the same terminal (it waits up to 10 minutes and frees the terminal the moment you're back); later on, in the background, resuming the same session under the night shift's careful mode.
-- 🖥️ **Agents on SSH servers too** — one forwarded port and Denny on your Mac sees the agent on the server, approvals included.
+| Feature | Free | Full / Agents Paid |
+| --- | :---: | :---: |
+| Overview, Claude Code / Codex limits and agent event notifications | ✓ | ✓ |
+| Mac notifications, clipboard, files and AirDrop | ✓ | ✓ |
+| Calendar, Mac Reminders, music and weather | ✓ | ✓ |
+| Agent chats and agent control | — | ✓ |
+| Office on VPS, ∞ALL, automation and other advanced sections | — | ✓ |
 
-**Limits and money**
-- 📊 Session and weekly limits for Claude and Codex with a pace marker and reset times — Claude's are live, refreshed after every reply through Claude Code's status line (your own status line keeps working).
-- 💎 **Plan value:** *"$1,240 at API prices on a $20 plan — ×62."* The number people screenshot.
-- 📈 Spending at API prices, cache hit rate, a trend chart, top models and projects, a 13-week activity map.
-- 🔄 Spend a banked Codex limit reset from the notch, with a confirmation.
+**Denny Agents is independent of the main Denny assistant.** They have separate apps and licenses. A main Denny key does not unlock Agents Paid. Enter an **Agents key** in the notch's **Settings → License and updates**. Claude/Codex accounts, subscriptions, API usage and servers are provided separately.
 
-**Your Mac**
-- ☕ **Keep Awake:** no idle sleep while an agent works — optionally even with the lid closed on the charger.
-- 🌡️ **Load:** CPU, memory pressure and swap of your Mac and connected servers, with a warning before a heavy build runs out of memory.
-- 📎 **Drop a file on the notch** to paste its path to your agent. If the agent runs on a server, Denny delivers the file there with your next message.
-- 🔔 Quiet notifications — only for long tasks, limits crossing a threshold or a daily budget, each once. One click silences Denny for an hour.
-- ⬆️ Updates itself from GitHub releases, checked once a day.
-- 🌍 10 languages: English, Русский, Українська, Deutsch, Français, Español, Português (Brasil), 简体中文, 日本語, 한국어.
+## Install on Mac
 
-## Install
+1. Download **[denny-agents-0.4.0-mac-arm64.dmg](https://github.com/LLC-AFTeam-Tech/denny-for-agents/releases/download/v0.4.0/denny-agents-0.4.0-mac-arm64.dmg)**.
+2. Open the DMG and drag **Denny Agents** to **Applications**.
+3. Launch it and move the pointer to the top center of the screen to open the notch. Use the gear button for settings.
 
-### Download
+**Requirements:** macOS 13 or later and an Apple Silicon Mac (M1 or later). This release does not include an Intel installer. Installing Agents does not replace the main Denny AI app.
 
-1. Get **DennyForAgents.zip** from the [latest release](../../releases/latest).
-2. Unzip and move **Denny for Agents.app** to **Applications**.
-3. The app isn't notarized by Apple yet. The first time, macOS says it can't check the developer: open **System Settings → Privacy & Security**, scroll down and click **Open Anyway**. Only once.
+**Apple notarization:** this build is signed with Apple Development, not Developer ID, and is not notarized. macOS may block the first launch. For a download you trust, use **System Settings → Privacy & Security → Open Anyway** if macOS offers it. Do not disable macOS security globally.
 
-### Homebrew
+### Connect the features you use
 
-```bash
-brew install --cask LLC-AFTeam-Tech/tap/denny-for-agents
-```
+- **Calendars and reminders:** enable access in settings. To use Google Calendar, add the Google account in **macOS System Settings → Internet Accounts**, enable Calendar, then connect Mac Calendar in Agents.
+- **Mac app notifications:** their history requires Full Disk Access for Agents. Agent events are a separate source. Read/hide actions only affect the notch feed, not the original apps.
+- **AirDrop:** add a file to the shelf, select it and choose AirDrop; complete the transfer in the macOS sharing interface.
+- **Updates:** open **Settings → License and updates**. Agents uses its own HTTPS update channel; downloaded updates are installed when you choose to install them.
 
-### Build from source
+For this release, use the DMG above. Older Homebrew and source-build instructions apply to the legacy 0.3.x app.
 
-macOS 13+ and Xcode 16+ (or the Swift toolchain):
+## Data and permissions
 
-```bash
-git clone https://github.com/LLC-AFTeam-Tech/denny-for-agents.git
-cd denny-for-agents
-swift test
-./scripts/build-app.sh
-open "dist/Denny for Agents.app"
-```
+Clipboard history, calendar and reminder data are handled on the Mac. Permissions are requested for the features that need them. Online features use their corresponding services: for example, license activation, update delivery, weather and connected agent services. The website demo uses fictional data and does not read your Mac.
 
-### Updates
+## Repository and licenses
 
-Denny checks GitHub once a day and tells you when a new version is out. **Settings → About → Update** downloads it, verifies its SHA-256 checksum, swaps the app and restarts. Installed with Homebrew? Use `brew upgrade denny-for-agents` instead.
+The source code already present in this repository belongs to the **legacy 0.3.x app**. Its existing [MIT license](LICENSE) remains unchanged. The new 0.4.0 application source is **not published here**; the release contains one installer attachment. This README and the public presentation images describe the new release.
 
-## Setup
+The Denny name, character, animations, icon and sounds retain their [asset license](LICENSE-ASSETS.md). Third-party notices are included in the app, together with a link to [corresponding library sources and build materials](https://shop.afteam.tech/agents/third-party/telegram-runtime-20261024-sources.tar.gz).
 
-On first launch Denny offers to connect to your agents. He adds his hooks to `~/.claude/settings.json` and `~/.codex/hooks.json`, saves a backup next to each file and never touches a file he can't parse. Each agent can be switched on or off in **Settings → Agents**.
+[Legacy 0.3.2 documentation](https://github.com/LLC-AFTeam-Tech/denny-for-agents/blob/v0.3.2/README.md) · [Release notes and checksum](https://github.com/LLC-AFTeam-Tech/denny-for-agents/releases/tag/v0.4.0) · [Support](https://t.me/AFTeamStore_bot)
 
-### Agents on an SSH server
-
-Claude Code or Codex run on a server (say, you work there through Termius or Terminal) and Denny runs on your Mac. Denny connects to the server over SSH himself and shows in the notch everything the agents do there.
-
-#### 1. An SSH key on the Mac (once)
-
-Denny connects the way you do from Terminal, but without a password — with a key. Check in **Terminal on the Mac** (not in Termius):
-
-```bash
-ssh user@server
-```
-
-Let in without a password — you have a key, go to step 2. Asked for a password (or you only use Termius) — create a key and send it to the server:
-
-```bash
-[ -f ~/.ssh/id_ed25519 ] || ssh-keygen -t ed25519 -N '' -f ~/.ssh/id_ed25519
-ssh-copy-id user@server
-```
-
-`ssh-copy-id` asks for the server password once. After that `ssh user@server` lets you in without one. A short name from `~/.ssh/config` works too.
-
-#### 2. Add the server
-
-**Settings → Servers → Denny's own connections** → enter `user@server` (or a name from `~/.ssh/config`) → **Add**.
-
-A dot appears next to it:
-
-| Dot | Meaning |
-|---|---|
-| 🟢 connected | all good |
-| 🟠 connecting… | give it a few seconds |
-| 🔴 with a note | something's in the way — see "If it won't connect" below; Denny keeps retrying |
-
-#### 3. Connect the agents (once per server)
-
-Press **Connect agents**. Denny puts his hook on the server (`~/.denny-for-agents/denny-hook.py`, needs only Python 3) and adds it to Claude Code's and Codex's settings — the old settings are kept next to them as a backup.
-
-Then **restart Claude Code / Codex on the server** — they only pick up new hooks at launch.
-
-Done: Allow / Deny requests, "the agent is writing code", receipts, limits and server load show up in the notch. Denny keeps the link alive himself: after the Mac sleeps, Wi-Fi changes or a VPN reconnects he connects again — no need to keep Termius open.
-
-After updating Denny, press **Connect agents** again to put the new hook version on the server.
-
-#### If it won't connect
-
-| Denny says | What to do |
-|---|---|
-| No SSH key for this server | Redo step 1. Denny shows the commands and a Copy commands button. |
-| Server unreachable | Check the address and the internet. If the server is only reachable over a VPN, turn it on. |
-| The server's key has changed | The server was reinstalled or replaced. If you're sure it's yours: `ssh-keygen -R server-address`, then `ssh user@server` and accept the new key. |
-| python3 isn't installed on the server | Install Python 3 there (e.g. `apt install python3`). |
-| Port is still busy on the server | Nothing to do: Denny takes the next port. Happens right after a dropped connection. |
-
-To check the hook on the server: `python3 ~/.denny-for-agents/denny-hook.py --ping`.
-
-To remove a server: 🗑 → Remove (the hook stays on the server) or Remove and disconnect agents on the server.
-
-#### By hand, without Denny's own connections
-
-If you'd rather keep the tunnel yourself (say, in Termius):
-
-1. Forward the port while connected. In Termius: **Port Forwarding → New → Remote**, server port `47321`, address `127.0.0.1`, destination `127.0.0.1:47321`. With plain ssh:
-   ```bash
-   ssh -R 47321:127.0.0.1:47321 you@server
-   ```
-2. Put [`remote/denny-hook.py`](remote/denny-hook.py) on the server in `~/.denny-for-agents/`.
-3. In **Settings → Servers**, copy the install command, run it on the server and check with `--ping`.
-4. Restart Claude Code / Codex on the server.
-
-Note: such a tunnel drops when the Mac sleeps, the network changes or Termius closes — and doesn't come back by itself.
-
-Either way, the forwarded port listens only on `127.0.0.1` on the server, and every request carries a secret token from your Mac.
-
-## How it works
-
-- **Hooks.** Claude Code and Codex run a tiny `denny-hook` on each event — session start, tool use, permission request, stop — which forwards it over a Unix socket in `~/.denny-for-agents/`. For a permission request it waits for your click and answers the agent. If nothing answers, it exits silently and the agent asks in its own prompt.
-- **Usage.** `denny-hook.py --report` reads the agents' own logs incrementally — token counts, model names and times only, never prompts or answers — and plan limits from Claude Code's status line, `~/.claude.json`, the Claude desktop app and `codex app-server`. Claude prices come from Anthropic's public list; models without a public price, Codex included, are counted in tokens.
-- **The notch.** A borderless SwiftUI panel hugging the camera notch (a capsule on Macs without one). Denny's animations are short videos, about half a megabyte in total.
-
-## Privacy
-
-No account, no analytics, no telemetry. Denny makes exactly two kinds of network requests, both to this GitHub repository and both anonymous: once a day he downloads the public price list ([`prices.json`](prices.json)) and checks for a new release. Only if you connect a Telegram bot do approval requests go through Telegram as well. Nothing about you, your code or your usage is ever sent.
-
-Hook events travel over a local Unix socket, or through the SSH tunnel you set up yourself. Safety-net snapshots stay on the machine where the agent runs (`~/.denny-for-agents/safety-net`). Files you drop on the notch go only to the server you're working on, with your next message.
-
-## The full Denny
-
-Denny for Agents is the free, open part of **[Denny](https://afteam.tech/denny/?utm_source=github)** — an AI companion for tasks, notes, reminders and offline AI on Mac and Android, with a file shelf and music controls in the notch.
-
-## License
-
-- **Code:** [MIT](LICENSE).
-- **The Denny name, character, animations, icon and sounds:** © AFTeam, all rights reserved — see [LICENSE-ASSETS.md](LICENSE-ASSETS.md). Shipping your own fork? Give it your own name and character.
-
-<sub>Claude and Claude Code are trademarks of Anthropic. Codex and ChatGPT are trademarks of OpenAI. Denny for Agents is an independent project and is not affiliated with or endorsed by either company.</sub>
+<sub>Made by AFTEAM. Independent of Anthropic and OpenAI. Claude, Claude Code, Codex and other product names belong to their respective owners.</sub>
