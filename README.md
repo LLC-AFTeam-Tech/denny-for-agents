@@ -85,7 +85,7 @@ These screenshots render the **native Mac interface with synthetic test data**, 
 - **AirDrop:** add a file to the shelf, select it and choose AirDrop; complete the transfer in the macOS sharing interface.
 - **Updates:** open **Settings → License and updates**. Agents uses its own HTTPS update channel; downloaded updates are installed when you choose to install them.
 
-For this release, use the DMG above. Older Homebrew and source-build instructions apply to the legacy 0.3.x app.
+The [Homebrew cask](https://github.com/LLC-AFTeam-Tech/homebrew-tap/blob/main/Casks/denny-for-agents.rb) also installs 0.5.0. Legacy source-build instructions apply to the 0.3.x app.
 
 ## Data and permissions
 
